@@ -5,14 +5,14 @@
 #include <stdint.h>
 #include <errno.h>
 
-#include "eventunit.h"
-#include "idma.h"
 #include "tile.h"
+#include "mg_idma.h"
+#include "mg_spatz.h"
+#include "mg_tile.h"
 
 #include "kernels_profiling_utils.h"
 
 #include "averagepool2d_fp16_spatz.h"
-#include "averagepool2d_fp16_spatz_params.h"
 #include "averagepool2d_fp16_spatz_task_bin.h"
 
 #define HID         get_hartid()
@@ -42,11 +42,8 @@ static int alloc_l1(void **params,
     size_t input_HW_len;
     size_t output_HW_len;
 
-    size_t c_start;
-    size_t c_end;
-    size_t c_len;
-    size_t elems;
-    size_t left;
+    uint32_t c_start;
+    uint32_t c_len;
 
     input_B    = input_shape[0];
     input_C    = input_shape[1];
@@ -57,12 +54,7 @@ static int alloc_l1(void **params,
     output_H = output_shape[2];
     output_W = output_shape[3];
 
-    elems = iterations / NUM_HARTS;
-    left  = iterations % NUM_HARTS;
-
-    c_start = HID * elems + (HID < left ? HID : left);
-    c_end   = c_start + elems + (HID < left ? 1 : 0);
-    c_len   = c_end - c_start;
+    mg_split(iterations, NUM_HARTS, HID, &c_start, &c_len);
 
     input_HW_len  = input_H * input_W;
     output_HW_len = output_H * output_W;
@@ -118,76 +110,13 @@ static int init_input_params(void *params, const float16 *X)
 
     /* This tile's channels [c_start, c_end) are contiguous in L2 (NCHW). The Spatz
        task writes every output element, so shard_Y is not zeroed here. */
-    idma_memcpy_1d(0,
-                   (uint32_t)(X + c_start * in_hw_len),
-                   (uint32_t)averagepool_params->shard_X,
-                   c_len * in_hw_len * sizeof(float16));
-    eu_idma_wait_a2o(WFE);
+    mg_idma_memcpy_1d_sync(WFE,
+                           0,
+                           (uint32_t)(X + c_start * in_hw_len),
+                           (uint32_t)averagepool_params->shard_X,
+                           c_len * in_hw_len * sizeof(float16));
 
     return 0;
-}
-
-static int offload_spatz_task(void *params)
-{
-    int ret;
-
-    spatz_run_task_with_params(AVERAGEPOOL2D_FP16_SPATZ_TASK, params);
-
-    ret = eu_spatz_wait(WFE);
-    if (ret == 0) {
-        printf("[CV32 (%d)] [%s] Wait on Spatz task completion failed with error: %d\n",
-               HID,
-               KERNEL_NAME,
-               ret);
-        goto exit;
-    }
-
-    ret = spatz_get_exit_code();
-
-exit:
-    return ret;
-}
-
-/*
- * AveragePool of NCHW planes on this tile's Spatz, for operands that are already in this tile's L1:
- * no sharding across tiles, no L1 allocation and no L2 transfers.
- */
-void MAGIA_averagepool2d_fp16_spatz_l1(const float16 *X,
-                                       float16 *Y,
-                                       uint32_t input_shape[4],
-                                       uint32_t output_shape[4],
-                                       uint32_t kernel_h,
-                                       uint32_t kernel_w,
-                                       uint32_t stride_h,
-                                       uint32_t stride_w,
-                                       uint32_t pad_h,
-                                       uint32_t pad_w)
-{
-    volatile averagepool2d_fp16_spatz_params_t params = {
-        .shard_X  = (uintptr_t)X,
-        .shard_Y  = (uintptr_t)Y,
-        .c_start  = 0,
-        .c_len    = input_shape[0] * input_shape[1],
-        .h_in     = input_shape[2],
-        .w_in     = input_shape[3],
-        .h_out    = output_shape[2],
-        .w_out    = output_shape[3],
-        .kernel_h = kernel_h,
-        .kernel_w = kernel_w,
-        .stride_h = stride_h,
-        .stride_w = stride_w,
-        .pad_h    = pad_h,
-        .pad_w    = pad_w,
-    };
-    int ret;
-
-    ret = offload_spatz_task((void *)&params);
-    if (ret != 0) {
-        printf("[CV32 (%d)] [%s] Spatz task offloading failed with error: %d\n",
-               HID,
-               KERNEL_NAME,
-               ret);
-    }
 }
 
 static int store_result(void *params, float16 *Y)
@@ -206,11 +135,11 @@ static int store_result(void *params, float16 *Y)
         return 0;
 
     /* This tile's output channels [c_start, c_end) are contiguous in L2 (NCHW). */
-    idma_memcpy_1d(1,
-                   (uint32_t)(Y + c_start * out_hw_len),
-                   (uint32_t)averagepool_params->shard_Y,
-                   c_len * out_hw_len * sizeof(float16));
-    eu_idma_wait_o2a(WFE);
+    mg_idma_memcpy_1d_sync(WFE,
+                           1,
+                           (uint32_t)(Y + c_start * out_hw_len),
+                           (uint32_t)averagepool_params->shard_Y,
+                           c_len * out_hw_len * sizeof(float16));
 
     return 0;
 }
@@ -231,7 +160,7 @@ void MAGIA_averagepool2d_fp16_spatz(const float16 *X,
 
     PROF_PHASE(prof_cyc_alloc,
                ret,
-               alloc_l1(&params,
+               alloc_l1((void **)&params,
                         input_shape,
                         output_shape,
                         kernel_h,
@@ -245,7 +174,7 @@ void MAGIA_averagepool2d_fp16_spatz(const float16 *X,
         return;
     }
 
-    PROF_PHASE(prof_cyc_data_in, ret, init_input_params(params, X));
+    PROF_PHASE(prof_cyc_data_in, ret, init_input_params((void *)params, X));
     if (ret != 0) {
         printf("[CV32 (%d)] [%s] Params initialization failed with error: %d\n",
                HID,
@@ -254,17 +183,67 @@ void MAGIA_averagepool2d_fp16_spatz(const float16 *X,
         return;
     }
 
-    PROF_PHASE(prof_cyc_compute, ret, offload_spatz_task(params));
+    PROF_PHASE(
+        prof_cyc_compute, ret, mg_spatz_call(AVERAGEPOOL2D_FP16_SPATZ_TASK, (const void *)params));
     if (ret != 0) {
-        printf("[CV32 (%d)] [%s] Spatz task offloading failed with error: %d\n",
-               HID,
-               KERNEL_NAME,
-               ret);
+        printf("[CV32 (%d)] [%s] Spatz task failed with exit code: %d\n", HID, KERNEL_NAME, ret);
         return;
     }
 
-    PROF_PHASE(prof_cyc_data_out, ret, store_result(params, Y));
+    PROF_PHASE(prof_cyc_data_out, ret, store_result((void *)params, Y));
     if (ret != 0) {
         printf("[CV32 (%d)] [%s] Result write back failed with error: %d\n", HID, KERNEL_NAME, ret);
     }
+}
+
+void MAGIA_averagepool2d_fp16_spatz_l1_start(averagepool2d_fp16_spatz_params_t *p,
+                                             const float16 *X,
+                                             float16 *Y,
+                                             uint32_t input_shape[4],
+                                             uint32_t output_shape[4],
+                                             uint32_t kernel_h,
+                                             uint32_t kernel_w,
+                                             uint32_t stride_h,
+                                             uint32_t stride_w,
+                                             uint32_t pad_h,
+                                             uint32_t pad_w,
+                                             mg_event_t *event)
+{
+    averagepool2d_fp16_spatz_params_set(
+        p, X, Y, input_shape, output_shape, kernel_h, kernel_w, stride_h, stride_w, pad_h, pad_w);
+    mg_spatz_run(WFE, AVERAGEPOOL2D_FP16_SPATZ_TASK, p, event, 0);
+}
+
+void MAGIA_averagepool2d_fp16_spatz_l1(const float16 *X,
+                                       float16 *Y,
+                                       uint32_t input_shape[4],
+                                       uint32_t output_shape[4],
+                                       uint32_t kernel_h,
+                                       uint32_t kernel_w,
+                                       uint32_t stride_h,
+                                       uint32_t stride_w,
+                                       uint32_t pad_h,
+                                       uint32_t pad_w)
+{
+    averagepool2d_fp16_spatz_params_t params;
+    mg_event_t event;
+
+    MAGIA_averagepool2d_fp16_spatz_l1_start(&params,
+                                            X,
+                                            Y,
+                                            input_shape,
+                                            output_shape,
+                                            kernel_h,
+                                            kernel_w,
+                                            stride_h,
+                                            stride_w,
+                                            pad_h,
+                                            pad_w,
+                                            &event);
+    mg_spatz_wait(WFE, &event);
+    if (mg_spatz_exit_code() != 0)
+        printf("[CV32 (%d)] [%s] Spatz task failed with exit code: %d\n",
+               HID,
+               KERNEL_NAME,
+               mg_spatz_exit_code());
 }

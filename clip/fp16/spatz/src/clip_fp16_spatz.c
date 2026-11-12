@@ -5,14 +5,14 @@
 #include <stdint.h>
 #include <errno.h>
 
-#include "eventunit.h"
-#include "idma.h"
 #include "tile.h"
+#include "mg_idma.h"
+#include "mg_spatz.h"
+#include "mg_tile.h"
 
 #include "kernels_profiling_utils.h"
 
 #include "clip_fp16_spatz.h"
-#include "clip_fp16_spatz_params.h"
 #include "clip_fp16_spatz_task_bin.h"
 
 #define HID         get_hartid()
@@ -21,22 +21,10 @@
 static int alloc_l1(void **params, uint32_t size)
 {
     volatile clip_fp16_spatz_params_t *clip_params;
-    uintptr_t shard_input;
-    uintptr_t shard_output;
-    uintptr_t min;
-    uintptr_t max;
+    uint32_t shard_start;
+    uint32_t shard_len;
 
-    size_t shard_start;
-    size_t shard_end;
-    size_t shard_len;
-    size_t elems;
-    size_t left;
-
-    elems       = size / NUM_HARTS;
-    left        = size % NUM_HARTS;
-    shard_start = HID * elems + (HID < left ? HID : left);
-    shard_end   = shard_start + elems + (HID < left ? 1 : 0);
-    shard_len   = shard_end - shard_start;
+    mg_split(size, NUM_HARTS, HID, &shard_start, &shard_len);
 
     l1_alloc_init();
 
@@ -44,29 +32,25 @@ static int alloc_l1(void **params, uint32_t size)
     if (!clip_params)
         return ENOMEM;
 
-    shard_input = l1_alloc(shard_len * sizeof(float16));
-    if (!shard_input)
+    clip_params->shard_input = (uintptr_t)l1_alloc(shard_len * sizeof(float16));
+    if (!clip_params->shard_input)
         return ENOMEM;
 
-    shard_output = l1_alloc(shard_len * sizeof(float16));
-    if (!shard_output)
+    clip_params->shard_output = (uintptr_t)l1_alloc(shard_len * sizeof(float16));
+    if (!clip_params->shard_output)
         return ENOMEM;
 
-    min = l1_alloc(sizeof(float16));
-    if (!min)
+    clip_params->min = (uintptr_t)l1_alloc(sizeof(float16));
+    if (!clip_params->min)
         return ENOMEM;
 
-    max = l1_alloc(sizeof(float16));
-    if (!max)
+    clip_params->max = (uintptr_t)l1_alloc(sizeof(float16));
+    if (!clip_params->max)
         return ENOMEM;
 
-    clip_params->shard_input  = shard_input;
-    clip_params->shard_output = shard_output;
-    clip_params->start        = shard_start;
-    clip_params->len          = shard_len;
-    clip_params->end          = shard_end;
-    clip_params->min          = min;
-    clip_params->max          = max;
+    clip_params->start = shard_start;
+    clip_params->len   = shard_len;
+    clip_params->end   = shard_start + shard_len;
 
     *params = (void *)clip_params;
 
@@ -75,96 +59,38 @@ static int alloc_l1(void **params, uint32_t size)
 
 static int init_input_params(void *params, const float16 *input, float16 minimum, float16 maximum)
 {
-    volatile clip_fp16_spatz_params_t *clip_params;
-    uint32_t start;
-    uint32_t len;
-
-    clip_params = (volatile clip_fp16_spatz_params_t *)params;
-    start       = clip_params->start;
-    len         = clip_params->len;
+    volatile clip_fp16_spatz_params_t *clip_params = params;
 
     mmio_fp16(clip_params->min) = minimum;
     mmio_fp16(clip_params->max) = maximum;
 
-    if (len == 0)
+    if (clip_params->len == 0)
         return 0;
 
     /* This tile's slice [start, start+len) is contiguous in L2. The Spatz task writes every
        output (Y = clip(X, min, max)), so shard_output is not zeroed here. */
-    idma_memcpy_1d(
-        0, (uint32_t)(input + start), (uint32_t)clip_params->shard_input, len * sizeof(float16));
-    eu_idma_wait_a2o(WFE);
+    mg_idma_memcpy_1d_sync(WFE,
+                           0,
+                           (uint32_t)(input + clip_params->start),
+                           clip_params->shard_input,
+                           clip_params->len * sizeof(float16));
 
     return 0;
 }
 
-static int offload_spatz_task(void *params)
-{
-    int ret;
-
-    spatz_run_task_with_params(CLIP_FP16_SPATZ_TASK, params);
-
-    ret = eu_spatz_wait(WFE);
-    if (ret == 0) {
-        printf("[CV32 (%d)] [%s] Wait on Spatz task completion failed with error: %d\n",
-               HID,
-               KERNEL_NAME,
-               ret);
-        goto exit;
-    }
-
-    ret = spatz_get_exit_code();
-
-exit:
-    return ret;
-}
-
-/*
- * output = clip(input, min, max) on this tile's Spatz, for operands that are already in this tile's
- * L1: no sharding across tiles, no L1 allocation and no L2 transfers. output may alias input.
- */
-void MAGIA_clip_fp16_spatz_l1(
-    const float16 *input, float16 *output, float16 min, float16 max, uint32_t size)
-{
-    volatile float16 min_val                 = min;
-    volatile float16 max_val                 = max;
-    volatile clip_fp16_spatz_params_t params = {
-        .shard_input  = (uintptr_t)input,
-        .shard_output = (uintptr_t)output,
-        .min          = (uintptr_t)&min_val,
-        .max          = (uintptr_t)&max_val,
-        .start        = 0,
-        .end          = size,
-        .len          = size,
-    };
-    int ret;
-
-    ret = offload_spatz_task((void *)&params);
-    if (ret != 0) {
-        printf("[CV32 (%d)] [%s] Spatz task offloading failed with error: %d\n",
-               HID,
-               KERNEL_NAME,
-               ret);
-    }
-}
-
 static int store_result(void *params, float16 *dst)
 {
-    volatile clip_fp16_spatz_params_t *clip_params;
-    uint32_t start;
-    uint32_t len;
+    volatile clip_fp16_spatz_params_t *clip_params = params;
 
-    clip_params = (volatile clip_fp16_spatz_params_t *)params;
-    start       = clip_params->start;
-    len         = clip_params->len;
-
-    if (len == 0)
+    if (clip_params->len == 0)
         return 0;
 
     /* This tile's output slice [start, start+len) is contiguous in L2. */
-    idma_memcpy_1d(
-        1, (uint32_t)(dst + start), (uint32_t)clip_params->shard_output, len * sizeof(float16));
-    eu_idma_wait_o2a(WFE);
+    mg_idma_memcpy_1d_sync(WFE,
+                           1,
+                           (uint32_t)(dst + clip_params->start),
+                           clip_params->shard_output,
+                           clip_params->len * sizeof(float16));
 
     return 0;
 }
@@ -175,13 +101,13 @@ void MAGIA_clip_fp16_spatz(
     int ret;
     volatile clip_fp16_spatz_params_t *params;
 
-    PROF_PHASE(prof_cyc_alloc, ret, alloc_l1(&params, size));
+    PROF_PHASE(prof_cyc_alloc, ret, alloc_l1((void **)&params, size));
     if (ret != 0) {
         printf("[CV32 (%d)] [%s] L1 allocation failed with error: %d\n", HID, KERNEL_NAME, ret);
         return;
     }
 
-    PROF_PHASE(prof_cyc_data_in, ret, init_input_params(params, input, min, max));
+    PROF_PHASE(prof_cyc_data_in, ret, init_input_params((void *)params, input, min, max));
     if (ret != 0) {
         printf("[CV32 (%d)] [%s] Params initialization failed with error: %d\n",
                HID,
@@ -190,17 +116,41 @@ void MAGIA_clip_fp16_spatz(
         return;
     }
 
-    PROF_PHASE(prof_cyc_compute, ret, offload_spatz_task(params));
+    PROF_PHASE(prof_cyc_compute, ret, mg_spatz_call(CLIP_FP16_SPATZ_TASK, (const void *)params));
     if (ret != 0) {
-        printf("[CV32 (%d)] [%s] Spatz task offloading failed with error: %d\n",
-               HID,
-               KERNEL_NAME,
-               ret);
+        printf("[CV32 (%d)] [%s] Spatz task failed with exit code: %d\n", HID, KERNEL_NAME, ret);
         return;
     }
 
-    PROF_PHASE(prof_cyc_data_out, ret, store_result(params, output));
+    PROF_PHASE(prof_cyc_data_out, ret, store_result((void *)params, output));
     if (ret != 0) {
         printf("[CV32 (%d)] [%s] Result write back failed with error: %d\n", HID, KERNEL_NAME, ret);
     }
+}
+
+void MAGIA_clip_fp16_spatz_l1_start(clip_fp16_spatz_params_t *p,
+                                    const float16 *input,
+                                    float16 *output,
+                                    float16 min,
+                                    float16 max,
+                                    uint32_t size,
+                                    mg_event_t *event)
+{
+    clip_fp16_spatz_params_set(p, input, output, min, max, size);
+    mg_spatz_run(WFE, CLIP_FP16_SPATZ_TASK, p, event, 0);
+}
+
+void MAGIA_clip_fp16_spatz_l1(
+    const float16 *input, float16 *output, float16 min, float16 max, uint32_t size)
+{
+    clip_fp16_spatz_params_t params;
+    mg_event_t event;
+
+    MAGIA_clip_fp16_spatz_l1_start(&params, input, output, min, max, size, &event);
+    mg_spatz_wait(WFE, &event);
+    if (mg_spatz_exit_code() != 0)
+        printf("[CV32 (%d)] [%s] Spatz task failed with exit code: %d\n",
+               HID,
+               KERNEL_NAME,
+               mg_spatz_exit_code());
 }

@@ -5,14 +5,14 @@
 #include <stdint.h>
 #include <errno.h>
 
-#include "eventunit.h"
-#include "idma.h"
 #include "tile.h"
+#include "mg_idma.h"
+#include "mg_spatz.h"
+#include "mg_tile.h"
 
 #include "kernels_profiling_utils.h"
 
 #include "softmax_fp16_spatz.h"
-#include "softmax_fp16_spatz_params.h"
 #include "softmax_fp16_spatz_task_bin.h"
 
 #define HID         get_hartid()
@@ -25,20 +25,12 @@ static int alloc_l1(void **params, uint32_t outer_dim, uint32_t reduce_dim, uint
     uintptr_t shard_output;
 
     uint32_t block;
-    uint32_t shard;
-    uint32_t left;
     uint32_t outer_start;
-    uint32_t outer_end;
     uint32_t outer_len;
 
     block = reduce_dim * inner_dim;
 
-    shard = outer_dim / NUM_HARTS;
-    left  = outer_dim % NUM_HARTS;
-
-    outer_start = HID * shard + (HID < left ? HID : left);
-    outer_end   = outer_start + shard + (HID < left ? 1 : 0);
-    outer_len   = outer_end - outer_start;
+    mg_split(outer_dim, NUM_HARTS, HID, &outer_start, &outer_len);
 
     l1_alloc_init();
 
@@ -68,101 +60,49 @@ static int alloc_l1(void **params, uint32_t outer_dim, uint32_t reduce_dim, uint
 
 static int init_input_params(void *params, const float16 *input)
 {
-    volatile softmax_fp16_spatz_params_t *softmax_params;
+    volatile softmax_fp16_spatz_params_t *softmax_params = params;
     uint32_t outer_start;
     uint32_t outer_len;
     uint32_t block;
 
-    softmax_params = (volatile softmax_fp16_spatz_params_t *)params;
-    outer_start    = softmax_params->outer_start;
-    outer_len      = softmax_params->outer_len;
-    block          = softmax_params->reduce_dim * softmax_params->inner_dim;
+    outer_start = softmax_params->outer_start;
+    outer_len   = softmax_params->outer_len;
+    block       = softmax_params->reduce_dim * softmax_params->inner_dim;
 
     if (outer_len == 0)
         return 0;
 
     /* This tile's outer slices [outer_start, outer_start+outer_len) are contiguous in L2. The
        Spatz task writes every output element, so shard_output is not zeroed here. */
-    idma_memcpy_1d(0,
-                   (uint32_t)(input + outer_start * block),
-                   (uint32_t)softmax_params->shard_input,
-                   outer_len * block * sizeof(float16));
-    eu_idma_wait_a2o(WFE);
+    mg_idma_memcpy_1d_sync(WFE,
+                           0,
+                           (uint32_t)(input + outer_start * block),
+                           softmax_params->shard_input,
+                           outer_len * block * sizeof(float16));
 
     return 0;
 }
 
-static int offload_spatz_task(void *params)
-{
-    int ret;
-
-    spatz_run_task_with_params(SOFTMAX_FP16_SPATZ_TASK, (uint32_t)params);
-
-    ret = eu_spatz_wait(WFE);
-    if (ret == 0) {
-        printf("[CV32 (%d)] [%s] Wait on Spatz task completion failed with error: %d\n",
-               HID,
-               KERNEL_NAME,
-               ret);
-        goto exit;
-    }
-
-    ret = spatz_get_exit_code();
-
-exit:
-    return ret;
-}
-
-/*
- * Softmax over reduce_dim on this tile's Spatz, for operands already in this tile's L1: no
- * sharding across tiles, no L1 allocation and no L2 transfers.
- */
-void MAGIA_softmax_fp16_spatz_l1(const float16 *input,
-                                 float16 *output,
-                                 uint32_t outer_dim,
-                                 uint32_t reduce_dim,
-                                 uint32_t inner_dim)
-{
-    volatile softmax_fp16_spatz_params_t params = {
-        .shard_input  = (uintptr_t)input,
-        .shard_output = (uintptr_t)output,
-        .reduce_dim   = reduce_dim,
-        .inner_dim    = inner_dim,
-        .outer_start  = 0,
-        .outer_len    = outer_dim,
-    };
-    int ret;
-
-    ret = offload_spatz_task((void *)&params);
-    if (ret != 0) {
-        printf("[CV32 (%d)] [%s] Spatz task offloading failed with error: %d\n",
-               HID,
-               KERNEL_NAME,
-               ret);
-    }
-}
-
 static int store_result(void *params, float16 *output)
 {
-    volatile softmax_fp16_spatz_params_t *softmax_params;
+    volatile softmax_fp16_spatz_params_t *softmax_params = params;
     uint32_t outer_start;
     uint32_t outer_len;
     uint32_t block;
 
-    softmax_params = (volatile softmax_fp16_spatz_params_t *)params;
-    outer_start    = softmax_params->outer_start;
-    outer_len      = softmax_params->outer_len;
-    block          = softmax_params->reduce_dim * softmax_params->inner_dim;
+    outer_start = softmax_params->outer_start;
+    outer_len   = softmax_params->outer_len;
+    block       = softmax_params->reduce_dim * softmax_params->inner_dim;
 
     if (outer_len == 0)
         return 0;
 
     /* This tile's output slices [outer_start, outer_start+outer_len) are contiguous in L2. */
-    idma_memcpy_1d(1,
-                   (uint32_t)(output + outer_start * block),
-                   (uint32_t)softmax_params->shard_output,
-                   outer_len * block * sizeof(float16));
-    eu_idma_wait_o2a(WFE);
+    mg_idma_memcpy_1d_sync(WFE,
+                           1,
+                           (uint32_t)(output + outer_start * block),
+                           softmax_params->shard_output,
+                           outer_len * block * sizeof(float16));
 
     return 0;
 }
@@ -191,12 +131,9 @@ void MAGIA_softmax_fp16_spatz(const float16 *input,
         return;
     }
 
-    PROF_PHASE(prof_cyc_compute, ret, offload_spatz_task((void *)params));
+    PROF_PHASE(prof_cyc_compute, ret, mg_spatz_call(SOFTMAX_FP16_SPATZ_TASK, (const void *)params));
     if (ret != 0) {
-        printf("[CV32 (%d)] [%s] Spatz task offloading failed with error: %d\n",
-               HID,
-               KERNEL_NAME,
-               ret);
+        printf("[CV32 (%d)] [%s] Spatz task failed with exit code: %d\n", HID, KERNEL_NAME, ret);
         return;
     }
 
@@ -204,4 +141,35 @@ void MAGIA_softmax_fp16_spatz(const float16 *input,
     if (ret != 0) {
         printf("[CV32 (%d)] [%s] Result write back failed with error: %d\n", HID, KERNEL_NAME, ret);
     }
+}
+
+void MAGIA_softmax_fp16_spatz_l1_start(softmax_fp16_spatz_params_t *p,
+                                       const float16 *input,
+                                       float16 *output,
+                                       uint32_t outer_dim,
+                                       uint32_t reduce_dim,
+                                       uint32_t inner_dim,
+                                       mg_event_t *event)
+{
+    softmax_fp16_spatz_params_set(p, input, output, outer_dim, reduce_dim, inner_dim);
+    mg_spatz_run(WFE, SOFTMAX_FP16_SPATZ_TASK, p, event, 0);
+}
+
+void MAGIA_softmax_fp16_spatz_l1(const float16 *input,
+                                 float16 *output,
+                                 uint32_t outer_dim,
+                                 uint32_t reduce_dim,
+                                 uint32_t inner_dim)
+{
+    softmax_fp16_spatz_params_t params;
+    mg_event_t event;
+
+    MAGIA_softmax_fp16_spatz_l1_start(
+        &params, input, output, outer_dim, reduce_dim, inner_dim, &event);
+    mg_spatz_wait(WFE, &event);
+    if (mg_spatz_exit_code() != 0)
+        printf("[CV32 (%d)] [%s] Spatz task failed with exit code: %d\n",
+               HID,
+               KERNEL_NAME,
+               mg_spatz_exit_code());
 }

@@ -5,12 +5,12 @@
 #include <stdint.h>
 #include <errno.h>
 
-#include "eventunit.h"
-#include "idma.h"
 #include "tile.h"
+#include "mg_idma.h"
+#include "mg_spatz.h"
+#include "mg_tile.h"
 
 #include "colsum_rescale_fp16_spatz.h"
-#include "colsum_rescale_fp16_spatz_params.h"
 #include "colsum_rescale_fp16_spatz_task_bin.h"
 
 #define HID         get_hartid()
@@ -22,12 +22,9 @@
  */
 static void tile_cols(uint32_t cols, uint32_t *col_start, uint32_t *col_len)
 {
-    uint32_t pairs = cols / 2;
-    uint32_t elems = pairs / NUM_HARTS;
-    uint32_t left  = pairs % NUM_HARTS;
-
-    *col_start = 2 * (HID * elems + (HID < left ? HID : left));
-    *col_len   = 2 * (elems + (HID < left ? 1 : 0));
+    mg_split(cols / 2, NUM_HARTS, HID, col_start, col_len);
+    *col_start *= 2;
+    *col_len *= 2;
     if (HID == NUM_HARTS - 1)
         *col_len += cols & 1;
 }
@@ -98,77 +95,41 @@ static int init_input_params(void *params,
     if (col_len == 0)
         return 0;
 
-    idma_memcpy_1d(
-        0, (uint32_t)(S + col_start), (uint32_t)cs_params->shard_S, col_len * sizeof(float16));
-    eu_idma_wait_a2o(WFE);
+    mg_idma_memcpy_1d_sync(WFE,
+                           0,
+                           (uint32_t)(S + col_start),
+                           (uint32_t)cs_params->shard_S,
+                           col_len * sizeof(float16));
 
     /*
      * This tile's columns of every row of G, packed into a rows x col_len matrix (row 0 is
      * unused by the task, but keeps the row indexing).
      */
     if (rows > 0) {
-        idma_memcpy_2d(0,
-                       (uint32_t)(G + col_start),
-                       (uint32_t)cs_params->shard_G,
-                       col_len * sizeof(float16),
-                       cols * sizeof(float16),
-                       rows);
-        eu_idma_wait_a2o(WFE);
+        mg_idma_memcpy_2d_sync(WFE,
+                               0,
+                               (uint32_t)(G + col_start),
+                               (uint32_t)cs_params->shard_G,
+                               col_len * sizeof(float16),
+                               cols * sizeof(float16),
+                               rows);
     }
 
     if (P) {
-        idma_memcpy_1d(
-            0, (uint32_t)(P + col_start), (uint32_t)cs_params->shard_P, col_len * sizeof(float16));
-        eu_idma_wait_a2o(WFE);
+        mg_idma_memcpy_1d_sync(WFE,
+                               0,
+                               (uint32_t)(P + col_start),
+                               (uint32_t)cs_params->shard_P,
+                               col_len * sizeof(float16));
 
-        idma_memcpy_1d(
-            0, (uint32_t)(A + col_start), (uint32_t)cs_params->shard_A, col_len * sizeof(float16));
-        eu_idma_wait_a2o(WFE);
+        mg_idma_memcpy_1d_sync(WFE,
+                               0,
+                               (uint32_t)(A + col_start),
+                               (uint32_t)cs_params->shard_A,
+                               col_len * sizeof(float16));
     }
 
     return 0;
-}
-
-static int offload_spatz_task(void *params)
-{
-    int ret;
-
-    spatz_run_task_with_params(COLSUM_RESCALE_FP16_SPATZ_TASK, (uint32_t)params);
-
-    ret = eu_spatz_wait(WFE);
-    if (ret == 0) {
-        printf("[CV32 (%d)] [%s] Wait on Spatz task completion failed with error: %d\n",
-               HID,
-               KERNEL_NAME,
-               ret);
-        goto exit;
-    }
-
-    ret = spatz_get_exit_code();
-
-exit:
-    return ret;
-}
-
-void MAGIA_colsum_rescale_fp16_spatz_l1(
-    float16 *S, const float16 *G, float16 *P, const float16 *A, uint32_t rows, uint32_t cols)
-{
-    volatile colsum_rescale_fp16_spatz_params_t params = {
-        .shard_S = (uintptr_t)S,
-        .shard_G = (uintptr_t)G,
-        .shard_P = (uintptr_t)P,
-        .shard_A = (uintptr_t)A,
-        .dims    = rows | (cols << 16),
-    };
-    int ret;
-
-    ret = offload_spatz_task((void *)&params);
-    if (ret != 0) {
-        printf("[CV32 (%d)] [%s] Spatz task offloading failed with error: %d\n",
-               HID,
-               KERNEL_NAME,
-               ret);
-    }
 }
 
 static int store_result(void *params, float16 *S, float16 *P, uint32_t cols)
@@ -183,15 +144,19 @@ static int store_result(void *params, float16 *S, float16 *P, uint32_t cols)
     if (col_len == 0)
         return 0;
 
-    idma_memcpy_1d(
-        1, (uint32_t)(S + col_start), (uint32_t)cs_params->shard_S, col_len * sizeof(float16));
-    eu_idma_wait_o2a(WFE);
+    mg_idma_memcpy_1d_sync(WFE,
+                           1,
+                           (uint32_t)(S + col_start),
+                           (uint32_t)cs_params->shard_S,
+                           col_len * sizeof(float16));
 
     /* P is rescaled in place. */
     if (P) {
-        idma_memcpy_1d(
-            1, (uint32_t)(P + col_start), (uint32_t)cs_params->shard_P, col_len * sizeof(float16));
-        eu_idma_wait_o2a(WFE);
+        mg_idma_memcpy_1d_sync(WFE,
+                               1,
+                               (uint32_t)(P + col_start),
+                               (uint32_t)cs_params->shard_P,
+                               col_len * sizeof(float16));
     }
 
     return 0;
@@ -218,12 +183,9 @@ void MAGIA_colsum_rescale_fp16_spatz(
         return;
     }
 
-    ret = offload_spatz_task((void *)params);
+    ret = mg_spatz_call(COLSUM_RESCALE_FP16_SPATZ_TASK, (const void *)params);
     if (ret != 0) {
-        printf("[CV32 (%d)] [%s] Spatz task offloading failed with error: %d\n",
-               HID,
-               KERNEL_NAME,
-               ret);
+        printf("[CV32 (%d)] [%s] Spatz task failed with exit code: %d\n", HID, KERNEL_NAME, ret);
         return;
     }
 
@@ -231,4 +193,32 @@ void MAGIA_colsum_rescale_fp16_spatz(
     if (ret != 0) {
         printf("[CV32 (%d)] [%s] Result write back failed with error: %d\n", HID, KERNEL_NAME, ret);
     }
+}
+
+void MAGIA_colsum_rescale_fp16_spatz_l1_start(colsum_rescale_fp16_spatz_params_t *p,
+                                              float16 *S,
+                                              const float16 *G,
+                                              float16 *P,
+                                              const float16 *A,
+                                              uint32_t rows,
+                                              uint32_t cols,
+                                              mg_event_t *event)
+{
+    colsum_rescale_fp16_spatz_params_set(p, S, G, P, A, rows, cols);
+    mg_spatz_run(WFE, COLSUM_RESCALE_FP16_SPATZ_TASK, p, event, 0);
+}
+
+void MAGIA_colsum_rescale_fp16_spatz_l1(
+    float16 *S, const float16 *G, float16 *P, const float16 *A, uint32_t rows, uint32_t cols)
+{
+    colsum_rescale_fp16_spatz_params_t params;
+    mg_event_t event;
+
+    MAGIA_colsum_rescale_fp16_spatz_l1_start(&params, S, G, P, A, rows, cols, &event);
+    mg_spatz_wait(WFE, &event);
+    if (mg_spatz_exit_code() != 0)
+        printf("[CV32 (%d)] [%s] Spatz task failed with exit code: %d\n",
+               HID,
+               KERNEL_NAME,
+               mg_spatz_exit_code());
 }

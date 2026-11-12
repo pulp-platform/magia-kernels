@@ -9,7 +9,7 @@
 #include <stdint.h>
 
 #include "tile.h"
-#include "fsync.h"
+#include "mg_fsync.h"
 #include "mg_idma.h"
 #include "mg_redmule.h"
 #include "mg_event.h"
@@ -87,14 +87,13 @@ void mgc_conv_im2col_partial(uint16_t *x_inp,
      */
     uint32_t hartid = get_hartid();
 
-    fsync_init();
     idma_init();
     redmule_init();
 
     eu_init();
     eu_redmule_init(0);
     eu_idma_init(0);
-    eu_fsync_init(0);
+    mg_fsync_init();
 
     uint32_t ii           = GET_Y_ID(hartid);
     uint32_t jj           = GET_X_ID(hartid);
@@ -156,8 +155,7 @@ void mgc_conv_im2col_partial(uint16_t *x_inp,
 
         // the caller's y_out may be in the shared .bss, which tile 0 clears in its crt0 while the
         // other tiles may already run: no output store before every tile is in main
-        fsync_sync_global();
-        eu_fsync_wait(WAIT_MODE);
+        mg_fsync_global(WAIT_MODE);
 
         for (int wb = 0; wb < CONV_WNB; wb++) {
             uint32_t x0 = wb * CONV_CP;

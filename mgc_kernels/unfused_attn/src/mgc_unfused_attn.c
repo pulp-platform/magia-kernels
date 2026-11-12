@@ -9,7 +9,8 @@
 #include <stdint.h>
 
 #include "tile.h"
-#include "fsync.h"
+#include "mg_fsync.h"
+#include "mg_spatz.h"
 #include "mg_idma.h"
 #include "mg_redmule.h"
 #include "mg_event.h"
@@ -22,7 +23,7 @@
     (SEQ_LENGTH / (MESH_X_TILES * MESH_Y_TILES) < 32 ? SEQ_LENGTH / (MESH_X_TILES * MESH_Y_TILES)  \
                                                      : 32)
 
-/** L1 kernel (CORE): all pointers are L1 addresses. */
+/** L1 kernel (SPATZ): all pointers are L1 addresses. */
 extern void l1_softmax_rows_fp16_spatz(uint32_t x, uint32_t p0, uint32_t p1);
 
 /**
@@ -55,18 +56,18 @@ void mgc_unfused_attn(uint16_t *q_inp,
 
     /**
      * 0. Get the mesh-tile's hartid, mesh-tile coordinates and define its L1 base,
-     * also initialize the controllers for the idma, redmule and fsync
+     * also initialize the controllers for the idma, redmule, fsync and Spatz
      */
     uint32_t hartid = get_hartid();
 
-    fsync_init();
     idma_init();
     redmule_init();
 
     eu_init();
     eu_redmule_init(0);
     eu_idma_init(0);
-    eu_fsync_init(0);
+    mg_fsync_init();
+    mg_spatz_init();
 
     uint32_t y_id         = GET_Y_ID(hartid);
     uint32_t x_id         = GET_X_ID(hartid);
@@ -177,8 +178,7 @@ void mgc_unfused_attn(uint16_t *q_inp,
     mg_event_t *idma_evts_sm_out_prev, *idma_evts_sm_out_curr;
 
     // all tiles start together
-    fsync_sync_global();
-    eu_fsync_wait(WAIT_MODE);
+    mg_fsync_global(WAIT_MODE);
 
     // 1. attn = Q @ Kt: the operands of timeslot i+1 are prefetched while RedMulE computes
     // timeslot i; the first job is a MATMUL, as attn is never loaded
@@ -265,8 +265,7 @@ void mgc_unfused_attn(uint16_t *q_inp,
 
     mg_idma_memcpy_2d(WAIT_MODE, 1, l2_addr_a, l1_addr_a, len_a, std_a, reps_a, &idma_evt_a, NULL);
     mg_idma_wait(1, WAIT_MODE, &idma_evt_a);
-    fsync_sync_global();
-    eu_fsync_wait(WAIT_MODE);
+    mg_fsync_global(WAIT_MODE);
 
     // 2. attn = softmax(attn / sqrt(P)) by rows, in place in L2: this tile owns sm_rows full
     // rows and streams them through L1, chunk c + 1 loading and chunk c - 1 storing while Spatz
@@ -346,8 +345,7 @@ void mgc_unfused_attn(uint16_t *q_inp,
             mg_idma_wait(1, WAIT_MODE, idma_evts_sm_out_prev);
         }
     }
-    fsync_sync_global();
-    eu_fsync_wait(WAIT_MODE);
+    mg_fsync_global(WAIT_MODE);
 
     // 3. O = attn @ V, as step 1
     mg_idma_memcpy_2d(

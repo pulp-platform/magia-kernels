@@ -5,12 +5,12 @@
 #include <stdint.h>
 #include <errno.h>
 
-#include "eventunit.h"
-#include "idma.h"
 #include "tile.h"
+#include "mg_idma.h"
+#include "mg_spatz.h"
+#include "mg_tile.h"
 
 #include "silu_fp16_spatz.h"
-#include "silu_fp16_spatz_params.h"
 #include "silu_fp16_spatz_task_bin.h"
 
 #define HID         get_hartid()
@@ -20,19 +20,10 @@ static int alloc_l1(void **params, uint32_t total_elems)
 {
     volatile silu_fp16_spatz_params_t *silu_params;
     uint32_t shard_X;
+    uint32_t elem_start;
+    uint32_t elem_len;
 
-    size_t elem_start;
-    size_t elem_end;
-    size_t elem_len;
-    size_t elems;
-    size_t left;
-
-    elems = total_elems / NUM_HARTS;
-    left  = total_elems % NUM_HARTS;
-
-    elem_start = HID * elems + (HID < left ? HID : left);
-    elem_end   = elem_start + elems + (HID < left ? 1 : 0);
-    elem_len   = elem_end - elem_start;
+    mg_split(total_elems, NUM_HARTS, HID, &elem_start, &elem_len);
 
     l1_alloc_init();
 
@@ -58,87 +49,34 @@ static int alloc_l1(void **params, uint32_t total_elems)
 
 static int init_input_params(void *params, const float16 *X)
 {
-    volatile silu_fp16_spatz_params_t *silu_params;
-    uint32_t elem_start;
-    uint32_t elem_len;
+    volatile silu_fp16_spatz_params_t *silu_params = params;
 
-    silu_params = (volatile silu_fp16_spatz_params_t *)params;
-    elem_start  = silu_params->elem_start;
-    elem_len    = silu_params->elem_len;
-
-    if (elem_len == 0)
+    if (silu_params->elem_len == 0)
         return 0;
 
     /* This tile's slice [elem_start, elem_start+elem_len) is contiguous in X. */
-    idma_memcpy_1d(
-        0, (uint32_t)(X + elem_start), (uint32_t)silu_params->shard_X, elem_len * sizeof(float16));
-    eu_idma_wait_a2o(WFE);
+    mg_idma_memcpy_1d_sync(WFE,
+                           0,
+                           (uint32_t)(X + silu_params->elem_start),
+                           silu_params->shard_X,
+                           silu_params->elem_len * sizeof(float16));
 
     return 0;
 }
 
-static int offload_spatz_task(void *params)
-{
-    int ret;
-
-    spatz_run_task_with_params(SILU_FP16_SPATZ_TASK, (uint32_t)params);
-
-    ret = eu_spatz_wait(WFE);
-    if (ret == 0) {
-        printf("[CV32 (%d)] [%s] Wait on Spatz task completion failed with error: %d\n",
-               HID,
-               KERNEL_NAME,
-               ret);
-        goto exit;
-    }
-
-    ret = spatz_get_exit_code();
-
-exit:
-    return ret;
-}
-
-/*
- * Y = SiLU(X) on this tile's Spatz, for operands that are already in this tile's L1: no sharding
- * across tiles, no L1 allocation and no L2 transfers. Y may alias X.
- */
-void MAGIA_silu_fp16_spatz_l1(const float16 *X, float16 *Y, uint32_t n)
-{
-    volatile silu_fp16_spatz_params_t params = {
-        .shard_X     = (uintptr_t)X,
-        .shard_Y     = (uintptr_t)Y,
-        .total_elems = n,
-        .elem_start  = 0,
-        .elem_len    = n,
-    };
-    int ret;
-
-    ret = offload_spatz_task((void *)&params);
-    if (ret != 0) {
-        printf("[CV32 (%d)] [%s] Spatz task offloading failed with error: %d\n",
-               HID,
-               KERNEL_NAME,
-               ret);
-    }
-}
-
 static int store_result(void *params, float16 *Y)
 {
-    volatile silu_fp16_spatz_params_t *silu_params;
-    uint32_t elem_start;
-    uint32_t elem_len;
+    volatile silu_fp16_spatz_params_t *silu_params = params;
 
-    silu_params = (volatile silu_fp16_spatz_params_t *)params;
-    elem_start  = silu_params->elem_start;
-    elem_len    = silu_params->elem_len;
-
-    if (elem_len == 0)
+    if (silu_params->elem_len == 0)
         return 0;
 
     /* This tile's output slice [elem_start, elem_start+elem_len) is contiguous in L2. */
-    idma_memcpy_1d(
-        1, (uint32_t)(Y + elem_start), (uint32_t)silu_params->shard_Y, elem_len * sizeof(float16));
-    eu_idma_wait_o2a(WFE);
+    mg_idma_memcpy_1d_sync(WFE,
+                           1,
+                           (uint32_t)(Y + silu_params->elem_start),
+                           silu_params->shard_Y,
+                           silu_params->elem_len * sizeof(float16));
 
     return 0;
 }
@@ -163,12 +101,9 @@ void MAGIA_silu_fp16_spatz(const float16 *X, float16 *Y, uint32_t total_elems)
         return;
     }
 
-    ret = offload_spatz_task((void *)params);
+    ret = mg_spatz_call(SILU_FP16_SPATZ_TASK, (const void *)params);
     if (ret != 0) {
-        printf("[CV32 (%d)] [%s] Spatz task offloading failed with error: %d\n",
-               HID,
-               KERNEL_NAME,
-               ret);
+        printf("[CV32 (%d)] [%s] Spatz task failed with exit code: %d\n", HID, KERNEL_NAME, ret);
         return;
     }
 
@@ -176,4 +111,25 @@ void MAGIA_silu_fp16_spatz(const float16 *X, float16 *Y, uint32_t total_elems)
     if (ret != 0) {
         printf("[CV32 (%d)] [%s] Result write back failed with error: %d\n", HID, KERNEL_NAME, ret);
     }
+}
+
+void MAGIA_silu_fp16_spatz_l1_start(
+    silu_fp16_spatz_params_t *p, const float16 *X, float16 *Y, uint32_t n, mg_event_t *event)
+{
+    silu_fp16_spatz_params_set(p, X, Y, n);
+    mg_spatz_run(WFE, SILU_FP16_SPATZ_TASK, p, event, 0);
+}
+
+void MAGIA_silu_fp16_spatz_l1(const float16 *X, float16 *Y, uint32_t n)
+{
+    silu_fp16_spatz_params_t params;
+    mg_event_t event;
+
+    MAGIA_silu_fp16_spatz_l1_start(&params, X, Y, n, &event);
+    mg_spatz_wait(WFE, &event);
+    if (mg_spatz_exit_code() != 0)
+        printf("[CV32 (%d)] [%s] Spatz task failed with exit code: %d\n",
+               HID,
+               KERNEL_NAME,
+               mg_spatz_exit_code());
 }

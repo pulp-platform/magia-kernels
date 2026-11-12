@@ -5,14 +5,14 @@
 #include <stdint.h>
 #include <errno.h>
 
-#include "eventunit.h"
-#include "idma.h"
 #include "tile.h"
+#include "mg_idma.h"
+#include "mg_spatz.h"
+#include "mg_tile.h"
 
 #include "kernels_profiling_utils.h"
 
 #include "instancenorm_fp16_spatz.h"
-#include "instancenorm_fp16_spatz_params.h"
 #include "instancenorm_fp16_spatz_task_bin.h"
 
 #define HID         get_hartid()
@@ -30,22 +30,14 @@ static int alloc_l1(void **params, uint32_t input_shape[4], uint32_t *out_num_ch
     uint32_t total_instances;
     uint32_t instance_len;
     uint32_t num_channels;
-    uint32_t shard;
-    uint32_t left;
     uint32_t inst_start;
-    uint32_t inst_end;
     uint32_t inst_len;
 
     num_channels    = input_shape[1];
     total_instances = input_shape[0] * input_shape[1];
     instance_len    = input_shape[2] * input_shape[3];
 
-    shard = total_instances / NUM_HARTS;
-    left  = total_instances % NUM_HARTS;
-
-    inst_start = HID * shard + (HID < left ? HID : left);
-    inst_end   = inst_start + shard + (HID < left ? 1 : 0);
-    inst_len   = inst_end - inst_start;
+    mg_split(total_instances, NUM_HARTS, HID, &inst_start, &inst_len);
 
     l1_alloc_init();
 
@@ -110,80 +102,23 @@ static int init_input_params(void *params,
     mmio_fp16(instancenorm_params->eps) = epsilon;
 
     /* Per-channel gamma/beta (full num_channels, contiguous) are needed by every tile. */
-    idma_memcpy_1d(
-        0, (uint32_t)scale, (uint32_t)instancenorm_params->gamma, num_channels * sizeof(float16));
-    eu_idma_wait_a2o(WFE);
-    idma_memcpy_1d(
-        0, (uint32_t)B, (uint32_t)instancenorm_params->beta, num_channels * sizeof(float16));
-    eu_idma_wait_a2o(WFE);
+    mg_idma_memcpy_1d_sync(
+        WFE, 0, (uint32_t)scale, instancenorm_params->gamma, num_channels * sizeof(float16));
+    mg_idma_memcpy_1d_sync(
+        WFE, 0, (uint32_t)B, instancenorm_params->beta, num_channels * sizeof(float16));
 
     if (inst_len == 0)
         return 0;
 
     /* This tile's instances [inst_start, inst_end) are contiguous in L2. The Spatz task fully
        writes shard_output, so it is not zeroed here. */
-    idma_memcpy_1d(0,
-                   (uint32_t)(input + inst_start * hw_len),
-                   (uint32_t)instancenorm_params->shard_input,
-                   inst_len * hw_len * sizeof(float16));
-    eu_idma_wait_a2o(WFE);
+    mg_idma_memcpy_1d_sync(WFE,
+                           0,
+                           (uint32_t)(input + inst_start * hw_len),
+                           instancenorm_params->shard_input,
+                           inst_len * hw_len * sizeof(float16));
 
     return 0;
-}
-
-static int offload_spatz_task(void *params)
-{
-    int ret;
-
-    spatz_run_task_with_params(INSTANCENORM_FP16_SPATZ_TASK, (uint32_t)params);
-
-    ret = eu_spatz_wait(WFE);
-    if (ret == 0) {
-        printf("[CV32 (%d)] [%s] Wait on Spatz task completion failed with error: %d\n",
-               HID,
-               KERNEL_NAME,
-               ret);
-        goto exit;
-    }
-
-    ret = spatz_get_exit_code();
-
-exit:
-    return ret;
-}
-
-/*
- * InstanceNorm of NCHW planes on this tile's Spatz, for operands already in this tile's L1: no
- * sharding across tiles, no L1 allocation and no L2 transfers.
- */
-void MAGIA_instancenorm_fp16_spatz_l1(const float16 *input,
-                                      float16 *output,
-                                      const float16 *scale,
-                                      const float16 *B,
-                                      const float16 epsilon,
-                                      uint32_t input_shape[4])
-{
-    volatile float16 eps                             = epsilon;
-    volatile instancenorm_fp16_spatz_params_t params = {
-        .shard_input  = (uintptr_t)input,
-        .shard_output = (uintptr_t)output,
-        .gamma        = (uintptr_t)scale,
-        .beta         = (uintptr_t)B,
-        .eps          = (uintptr_t)&eps,
-        .inst_start   = 0,
-        .inst_len     = input_shape[0] * input_shape[1],
-        .hw_len       = input_shape[2] * input_shape[3],
-        .num_channels = input_shape[1],
-    };
-    int ret;
-
-    ret = offload_spatz_task((void *)&params);
-    if (ret != 0) {
-        printf("[CV32 (%d)] [%s] Spatz task offloading failed with error: %d\n",
-               HID,
-               KERNEL_NAME,
-               ret);
-    }
 }
 
 static int store_result(void *params, float16 *output)
@@ -202,11 +137,11 @@ static int store_result(void *params, float16 *output)
         return 0;
 
     /* This tile's output instances [inst_start, inst_end) are contiguous in L2. */
-    idma_memcpy_1d(1,
-                   (uint32_t)(output + inst_start * hw_len),
-                   (uint32_t)instancenorm_params->shard_output,
-                   inst_len * hw_len * sizeof(float16));
-    eu_idma_wait_o2a(WFE);
+    mg_idma_memcpy_1d_sync(WFE,
+                           1,
+                           (uint32_t)(output + inst_start * hw_len),
+                           instancenorm_params->shard_output,
+                           inst_len * hw_len * sizeof(float16));
 
     return 0;
 }
@@ -237,12 +172,10 @@ void MAGIA_instancenorm_fp16_spatz(const float16 *input,
         return;
     }
 
-    PROF_PHASE(prof_cyc_compute, ret, offload_spatz_task((void *)params));
+    PROF_PHASE(
+        prof_cyc_compute, ret, mg_spatz_call(INSTANCENORM_FP16_SPATZ_TASK, (const void *)params));
     if (ret != 0) {
-        printf("[CV32 (%d)] [%s] Spatz task offloading failed with error: %d\n",
-               HID,
-               KERNEL_NAME,
-               ret);
+        printf("[CV32 (%d)] [%s] Spatz task failed with exit code: %d\n", HID, KERNEL_NAME, ret);
         return;
     }
 
@@ -250,4 +183,37 @@ void MAGIA_instancenorm_fp16_spatz(const float16 *input,
     if (ret != 0) {
         printf("[CV32 (%d)] [%s] Result write back failed with error: %d\n", HID, KERNEL_NAME, ret);
     }
+}
+
+void MAGIA_instancenorm_fp16_spatz_l1_start(instancenorm_fp16_spatz_params_t *p,
+                                            const float16 *input,
+                                            float16 *output,
+                                            const float16 *scale,
+                                            const float16 *B,
+                                            const float16 epsilon,
+                                            uint32_t input_shape[4],
+                                            mg_event_t *event)
+{
+    instancenorm_fp16_spatz_params_set(p, input, output, scale, B, epsilon, input_shape);
+    mg_spatz_run(WFE, INSTANCENORM_FP16_SPATZ_TASK, p, event, 0);
+}
+
+void MAGIA_instancenorm_fp16_spatz_l1(const float16 *input,
+                                      float16 *output,
+                                      const float16 *scale,
+                                      const float16 *B,
+                                      const float16 epsilon,
+                                      uint32_t input_shape[4])
+{
+    instancenorm_fp16_spatz_params_t params;
+    mg_event_t event;
+
+    MAGIA_instancenorm_fp16_spatz_l1_start(
+        &params, input, output, scale, B, epsilon, input_shape, &event);
+    mg_spatz_wait(WFE, &event);
+    if (mg_spatz_exit_code() != 0)
+        printf("[CV32 (%d)] [%s] Spatz task failed with exit code: %d\n",
+               HID,
+               KERNEL_NAME,
+               mg_spatz_exit_code());
 }

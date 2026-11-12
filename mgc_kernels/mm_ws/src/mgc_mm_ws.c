@@ -9,7 +9,7 @@
 #include <stdint.h>
 
 #include "tile.h"
-#include "fsync.h"
+#include "mg_fsync.h"
 #include "mg_idma.h"
 #include "mg_redmule.h"
 #include "mg_event.h"
@@ -35,14 +35,13 @@ void mgc_mm_ws(uint16_t *x_inp,
      */
     uint32_t hartid = get_hartid();
 
-    fsync_init();
     idma_init();
     redmule_init();
 
     eu_init();
     eu_redmule_init(0);
     eu_idma_init(0);
-    eu_fsync_init(0);
+    mg_fsync_init();
 
     uint32_t y_id         = GET_Y_ID(hartid);
     uint32_t x_id         = GET_X_ID(hartid);
@@ -145,8 +144,7 @@ void mgc_mm_ws(uint16_t *x_inp,
 
         mg_idma_memcpy_2d(
             WAIT_MODE, 0, l2_addr_x, l1_addr_x_0, len_x, std_x, reps_x, &idma_evts_x_in_0, NULL);
-        fsync_sync_global();
-        eu_fsync_wait(WAIT_MODE);
+        mg_fsync_global(WAIT_MODE);
 
         /**
          * systolic: 3 stages; step pt runs stage k on iteration pt + 1 - k
@@ -269,8 +267,7 @@ void mgc_mm_ws(uint16_t *x_inp,
                     mg_redmule_wait(WAIT_MODE, &redmule_evt);
                 }
             }
-            fsync_sync_global();
-            eu_fsync_wait(WAIT_MODE);
+            mg_fsync_global(WAIT_MODE);
         }
     }
 }

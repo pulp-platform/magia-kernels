@@ -21,6 +21,7 @@ typedef struct {
     uint32_t c_start;  /* Tile's channel shard start       */
     uint32_t c_len;    /* Tile's number of channels        */
     uint32_t hw_len;   /* Elements per channel             */
+    _Float16 eps_l1;   /* Storage for epsilon (L1 API)     */
 } batchnorm_fp16_spatz_params_t;
 
 #endif /* BATCHNORM_FP16_SPATZ_PARAMS_H_ */

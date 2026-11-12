@@ -26,7 +26,7 @@ SM_CHUNK = define("(SEQ_LENGTH / (MESH_X_TILES * MESH_Y_TILES) < 32 ? SEQ_LENGTH
 
 # Implemented in src/kernels.c, synchronous on the tile's CV32 core:
 # x[r, :] = softmax(x[r, :] / sqrt(PROJ_SIZE)) in place on Spatz (scale folded into the exp).
-spatz_softmax_rows = l1_kernel("l1_softmax_rows_fp16_spatz", operands=("x:inout",), params=("x.shape[0]", "x.shape[1]"), executor=CORE)
+spatz_softmax_rows = l1_kernel("l1_softmax_rows_fp16_spatz", operands=("x:inout",), params=("x.shape[0]", "x.shape[1]"), executor=SPATZ)
 
 
 @kernel("mgc_unfused_attn", check=(o_, o_gold), tol=0x11)

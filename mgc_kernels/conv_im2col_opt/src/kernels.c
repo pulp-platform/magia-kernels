@@ -13,13 +13,12 @@
 #define MGC_GLUE
 #include "mgc_conv_im2col_opt.h"
 #include "tile.h"
+#include "mg_spatz.h"
 #include "im2col_opt_fp16_spatz_params.h"
 #include "eventunit.h"
 #include "mg_idma.h"
+#define SPATZ_BINARY_NO_DEFINE
 #include "conv_im2col_opt_spatz_task_bin.h"
-
-/* Per-tile flag: set once Spatz has been set up on this tile (before its first task). */
-static volatile uint8_t spatz_ready __attribute__((section(".tile_bss")));
 
 /* Per-tile Spatz task parameters, preallocated in the per-tile L1. */
 static struct {
@@ -50,28 +49,6 @@ static uint32_t share_x0 __attribute__((section(".tile_bss")));
  * a part past its end has none).
  */
 static uint32_t share_n __attribute__((section(".tile_bss")));
-
-/**
- * Lazy Spatz setup on this tile (event unit line, binary and clock): the mgc-generated main
- * does not know about Spatz.
- */
-static void spatz_setup(void)
-{
-    if (spatz_ready)
-        return;
-    eu_spatz_init(0);
-    spatz_init(SPATZ_BINARY_START);
-    spatz_ready = 1;
-}
-
-/* Starts `task` on this tile's Spatz with the parameter block `params`, without waiting. */
-static inline void spatz_launch(uint32_t task, void *params)
-{
-    spatz_setup();
-    /* Compiler barrier: the parameter-block stores must be issued before Spatz is triggered. */
-    asm volatile("" ::: "memory");
-    spatz_run_task_with_params(task, (uint32_t)params);
-}
 
 /**
  * Starts the im2col of the CONV_CP output pixels of output row `row`, columns x0 .. x0 + CONV_CP - 1, into `col`
@@ -131,7 +108,7 @@ void l1_im2col_start_fp16_spatz(uint32_t col, uint32_t x, uint32_t row, uint32_t
             return;
     }
 #endif
-    spatz_launch(IM2COL_OPT_FP16_SPATZ_TASK, p);
+    mg_spatz_start(IM2COL_OPT_FP16_SPATZ_TASK, p);
 }
 
 /**
@@ -156,21 +133,21 @@ void l1_im2col_wait(uint32_t col)
         uint32_t n     = share_n - first < SHARE_CHUNK ? share_n - first : SHARE_CHUNK;
         uint32_t addr  = share_part + first * CONV_KKC * 2;
 
-        eu_wait_events(EU_SPATZ_DONE_MASK, WFE, 0);
+        mg_spatz_wait_last(WFE);
         if (c + 1 < nb_chunks) {
             uint32_t next = first + SHARE_CHUNK;
 
             p->dst = share_part + next * CONV_KKC * 2;
             p->x0  = share_x0 + next;
             p->cp  = share_n - next < SHARE_CHUNK ? share_n - next : SHARE_CHUNK;
-            spatz_launch(IM2COL_OPT_FP16_SPATZ_TASK, p);
+            mg_spatz_start(IM2COL_OPT_FP16_SPATZ_TASK, p);
         }
         /* same-direction iDMA jobs complete in order: waiting for the last one waits for all of them */
         mg_idma_mcast_row(WFE, 1, addr, addr, n * CONV_KKC * 2, &ev, NULL);
     }
     mg_idma_wait(1, WFE, &ev);
 #else
-    eu_wait_events(EU_SPATZ_DONE_MASK, WFE, 0);
+    mg_spatz_wait_last(WFE);
 #endif
 }
 

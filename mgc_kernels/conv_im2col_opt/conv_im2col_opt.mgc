@@ -68,8 +68,8 @@ WAIT_MODE = define(WFE)
 # - im2col_wait(col) builds the rest of the part, multicasts it to the other tiles of the row, and waits for all
 #   of it.
 im2col_start = l1_kernel("l1_im2col_start_fp16_spatz", operands=("col:out", "x:in"), params=(), args=("row", "x0"),
-                         executor=CORE)
-im2col_wait = l1_kernel("l1_im2col_wait", operands=("col:out",), params=(), executor=CORE)
+                         executor=SPATZ)
+im2col_wait = l1_kernel("l1_im2col_wait", operands=("col:out",), params=(), executor=SPATZ)
 
 
 @kernel("mgc_conv_im2col_opt", check=(y_, y_gold), tol=0x11)

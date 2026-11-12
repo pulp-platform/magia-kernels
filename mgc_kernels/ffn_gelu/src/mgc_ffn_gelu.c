@@ -9,7 +9,8 @@
 #include <stdint.h>
 
 #include "tile.h"
-#include "fsync.h"
+#include "mg_fsync.h"
+#include "mg_spatz.h"
 #include "mg_idma.h"
 #include "mg_redmule.h"
 #include "mg_event.h"
@@ -17,10 +18,10 @@
 
 #define WAIT_MODE WFE
 
-/** L1 kernel (CORE): all pointers are L1 addresses. */
+/** L1 kernel (SPATZ): all pointers are L1 addresses. */
 extern void l1_gelu_start_fp16_spatz(uint32_t x, uint32_t p0);
 
-/** L1 kernel (CORE): all pointers are L1 addresses. */
+/** L1 kernel (SPATZ): all pointers are L1 addresses. */
 extern void l1_spatz_wait1(uint32_t x);
 
 /**
@@ -64,18 +65,18 @@ void mgc_ffn_gelu(uint16_t *x_inp,
 
     /**
      * 0. Get the mesh-tile's hartid, mesh-tile coordinates and define its L1 base,
-     * also initialize the controllers for the idma, redmule and fsync
+     * also initialize the controllers for the idma, redmule, fsync and Spatz
      */
     uint32_t hartid = get_hartid();
 
-    fsync_init();
     idma_init();
     redmule_init();
 
     eu_init();
     eu_redmule_init(0);
     eu_idma_init(0);
-    eu_fsync_init(0);
+    mg_fsync_init();
+    mg_spatz_init();
 
     uint32_t ii           = GET_Y_ID(hartid);
     uint32_t jj           = GET_X_ID(hartid);
@@ -172,8 +173,7 @@ void mgc_ffn_gelu(uint16_t *x_inp,
         uint32_t l1_addr_yo   = l1_addr_w2_1 + (FFN_KB_I * tile_e * 2);
         uint32_t l2_addr_yo =
             (uint32_t)y_out + (tile_s_max * ii * EMBED_SIZE * 2) + (tile_e_max * jj * 2);
-        fsync_sync_global();
-        eu_fsync_wait(WAIT_MODE);
+        mg_fsync_global(WAIT_MODE);
 
         /**
          * STEP 1: H = gelu(X @ W1), one chunk of FFN_CI columns at a time. In each chunk, blocks k
@@ -353,8 +353,7 @@ void mgc_ffn_gelu(uint16_t *x_inp,
         }
 
         // H complete in L2
-        fsync_sync_global();
-        eu_fsync_wait(WAIT_MODE);
+        mg_fsync_global(WAIT_MODE);
 
         /**
          * STEP 2: Y = R + H @ W2, block k of H, W2 loading while RedMulE accumulates block k - 1

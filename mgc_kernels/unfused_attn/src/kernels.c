@@ -13,12 +13,12 @@
 #define MGC_GLUE
 #include "mgc_unfused_attn.h"
 #include "tile.h"
+#include "mg_spatz.h"
+#include "mg_tile.h"
 #include "eventunit.h"
 #include "softmax_rows_fp16_spatz_params.h"
+#define SPATZ_BINARY_NO_DEFINE
 #include "unfused_attn_spatz_task_bin.h"
-
-/* Per-tile flag: set once Spatz has been set up on this tile (before its first task). */
-static volatile uint8_t spatz_ready __attribute__((section(".tile_bss")));
 
 /* Per-tile Spatz task parameters, in the per-tile L1. */
 static softmax_rows_fp16_spatz_params_t sm_params __attribute__((section(".tile_bss")));
@@ -31,22 +31,17 @@ void l1_softmax_rows_fp16_spatz(uint32_t x, uint32_t rows, uint32_t cols)
 {
     softmax_rows_fp16_spatz_params_t *p = &sm_params;
 
-    /* Lazy Spatz setup and fixed fields: the mgc-generated main does not know about Spatz. */
-    if (!spatz_ready) {
+    /* The fixed field, on the first call (the scaled exp constants are never 0). */
+    if (!p->min_coef) {
         union { float16 f[2]; uint32_t u; } min_coef;
-        float16 s = (float16)((union { uint16_t u; float16 f; }){.u = QK_SCALE_FP16}.f);
+        float16 s = mg_fp16_from_bits(QK_SCALE_FP16);
 
         min_coef.f[0] = (float16)(SOFTMAX_ROWS_EXP_MIN / (float)s);
         min_coef.f[1] = (float16)(SOFTMAX_ROWS_EXP_COEF * (float)s);
         p->min_coef   = min_coef.u;
-        eu_spatz_init(0);
-        spatz_init(SPATZ_BINARY_START);
-        spatz_ready = 1;
     }
     p->shard_X = x;
     p->dims    = rows | (cols << 16);
-    /* Compiler barrier: the parameter-block stores must be issued before Spatz is triggered. */
-    asm volatile("" ::: "memory");
-    spatz_run_task_with_params(SOFTMAX_ROWS_FP16_SPATZ_TASK, (uint32_t)p);
-    eu_wait_events(EU_SPATZ_DONE_MASK, WFE, 0);
+    mg_spatz_start(SOFTMAX_ROWS_FP16_SPATZ_TASK, p);
+    mg_spatz_wait_last(WFE);
 }

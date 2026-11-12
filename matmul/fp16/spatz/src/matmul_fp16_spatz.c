@@ -5,9 +5,10 @@
 #include <stdint.h>
 #include <errno.h>
 
-#include "eventunit.h"
-#include "idma.h"
 #include "tile.h"
+#include "mg_idma.h"
+#include "mg_spatz.h"
+#include "mg_tile.h"
 
 #include "kernels_profiling_utils.h"
 
@@ -26,17 +27,9 @@ static int alloc_l1(void **params, uint32_t M, uint32_t K, uint32_t O, uint32_t 
     uintptr_t shard_Y;
 
     uint32_t batch_start;
-    uint32_t batch_end;
     uint32_t batch_len;
-    uint32_t shard;
-    uint32_t left;
 
-    shard = total_batches / NUM_HARTS;
-    left  = total_batches % NUM_HARTS;
-
-    batch_start = HID * shard + (HID < left ? HID : left);
-    batch_end   = batch_start + shard + (HID < left ? 1 : 0);
-    batch_len   = batch_end - batch_start;
+    mg_split(total_batches, NUM_HARTS, HID, &batch_start, &batch_len);
 
     l1_alloc_init();
 
@@ -93,55 +86,26 @@ static int init_input_params(
        batch slot with a 2D transfer whose source stride is 0. The Spatz task overwrites
        the whole output shard, so shard_Y is not zeroed here. */
     if (a_batched)
-        idma_memcpy_1d(0,
-                       (uint32_t)(A + batch_start * a_elems),
-                       (uint32_t)matmul_params->shard_A,
-                       batch_len * a_elems * sizeof(float16));
+        mg_idma_memcpy_1d_sync(WFE,
+                               0,
+                               (uint32_t)(A + batch_start * a_elems),
+                               matmul_params->shard_A,
+                               batch_len * a_elems * sizeof(float16));
     else
-        idma_memcpy_2d(0,
-                       (uint32_t)A,
-                       (uint32_t)matmul_params->shard_A,
-                       a_elems * sizeof(float16),
-                       0,
-                       batch_len);
-    eu_idma_wait_a2o(WFE);
+        mg_idma_memcpy_2d_sync(
+            WFE, 0, (uint32_t)A, matmul_params->shard_A, a_elems * sizeof(float16), 0, batch_len);
 
     if (b_batched)
-        idma_memcpy_1d(0,
-                       (uint32_t)(B + batch_start * b_elems),
-                       (uint32_t)matmul_params->shard_B,
-                       batch_len * b_elems * sizeof(float16));
+        mg_idma_memcpy_1d_sync(WFE,
+                               0,
+                               (uint32_t)(B + batch_start * b_elems),
+                               matmul_params->shard_B,
+                               batch_len * b_elems * sizeof(float16));
     else
-        idma_memcpy_2d(0,
-                       (uint32_t)B,
-                       (uint32_t)matmul_params->shard_B,
-                       b_elems * sizeof(float16),
-                       0,
-                       batch_len);
-    eu_idma_wait_a2o(WFE);
+        mg_idma_memcpy_2d_sync(
+            WFE, 0, (uint32_t)B, matmul_params->shard_B, b_elems * sizeof(float16), 0, batch_len);
 
     return 0;
-}
-
-static int offload_spatz_task(void *params)
-{
-    int ret;
-
-    spatz_run_task_with_params(MATMUL_FP16_SPATZ_TASK, (uint32_t)params);
-
-    ret = eu_spatz_wait(WFE);
-    if (ret == 0) {
-        printf("[CV32 (%d)] [%s] Wait on Spatz task completion failed with error: %d\n",
-               HID,
-               KERNEL_NAME,
-               ret);
-        goto exit;
-    }
-
-    ret = spatz_get_exit_code();
-
-exit:
-    return ret;
 }
 
 /*
@@ -158,7 +122,7 @@ void MAGIA_matmul_fp16_spatz_l1(const float16 *A,
                                 uint32_t a_batched,
                                 uint32_t b_batched)
 {
-    volatile matmul_fp16_spatz_params_t params = {
+    matmul_fp16_spatz_params_t params = {
         .shard_A     = (uintptr_t)A,
         .shard_B     = (uintptr_t)B,
         .shard_Y     = (uintptr_t)Y,
@@ -185,12 +149,10 @@ void MAGIA_matmul_fp16_spatz_l1(const float16 *A,
         params.shard_B = (uintptr_t)(B + (b_batched ? b * K * O : 0));
         params.shard_Y = (uintptr_t)(Y + b * M * O);
 
-        ret = offload_spatz_task((void *)&params);
+        ret = mg_spatz_call(MATMUL_FP16_SPATZ_TASK, (const void *)&params);
         if (ret != 0) {
-            printf("[CV32 (%d)] [%s] Spatz task offloading failed with error: %d\n",
-                   HID,
-                   KERNEL_NAME,
-                   ret);
+            printf(
+                "[CV32 (%d)] [%s] Spatz task failed with exit code: %d\n", HID, KERNEL_NAME, ret);
             return;
         }
     }
@@ -212,11 +174,11 @@ static int store_result(void *params, float16 *Y)
         return 0;
 
     /* Y is always batched: this tile's batches are a contiguous L2 block -> a 1D transfer. */
-    idma_memcpy_1d(1,
-                   (uint32_t)(Y + batch_start * y_elems),
-                   (uint32_t)matmul_params->shard_Y,
-                   batch_len * y_elems * sizeof(float16));
-    eu_idma_wait_o2a(WFE);
+    mg_idma_memcpy_1d_sync(WFE,
+                           1,
+                           (uint32_t)(Y + batch_start * y_elems),
+                           matmul_params->shard_Y,
+                           batch_len * y_elems * sizeof(float16));
 
     return 0;
 }
@@ -250,12 +212,9 @@ void MAGIA_matmul_fp16_spatz(const float16 *A,
         return;
     }
 
-    PROF_PHASE(prof_cyc_compute, ret, offload_spatz_task((void *)params));
+    PROF_PHASE(prof_cyc_compute, ret, mg_spatz_call(MATMUL_FP16_SPATZ_TASK, (const void *)params));
     if (ret != 0) {
-        printf("[CV32 (%d)] [%s] Spatz task offloading failed with error: %d\n",
-               HID,
-               KERNEL_NAME,
-               ret);
+        printf("[CV32 (%d)] [%s] Spatz task failed with exit code: %d\n", HID, KERNEL_NAME, ret);
         return;
     }
 

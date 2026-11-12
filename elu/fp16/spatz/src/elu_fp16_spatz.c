@@ -5,14 +5,14 @@
 #include <stdint.h>
 #include <errno.h>
 
-#include "eventunit.h"
-#include "idma.h"
 #include "tile.h"
+#include "mg_idma.h"
+#include "mg_spatz.h"
+#include "mg_tile.h"
 
 #include "kernels_profiling_utils.h"
 
 #include "elu_fp16_spatz.h"
-#include "elu_fp16_spatz_params.h"
 #include "elu_fp16_spatz_task_bin.h"
 
 #define HID         get_hartid()
@@ -21,21 +21,10 @@
 static int allocate_l1(void **params, uint32_t size)
 {
     volatile elu_fp16_spatz_params_t *elu_params;
-    uintptr_t shard_X;
-    uintptr_t shard_Y;
-    uintptr_t alpha;
+    uint32_t shard_start;
+    uint32_t shard_len;
 
-    size_t shard_start;
-    size_t shard_end;
-    size_t shard_len;
-    size_t elems;
-    size_t left;
-
-    elems       = size / NUM_HARTS;
-    left        = size % NUM_HARTS;
-    shard_start = HID * elems + (HID < left ? HID : left);
-    shard_end   = shard_start + elems + (HID < left ? 1 : 0);
-    shard_len   = shard_end - shard_start;
+    mg_split(size, NUM_HARTS, HID, &shard_start, &shard_len);
 
     l1_alloc_init();
 
@@ -43,24 +32,21 @@ static int allocate_l1(void **params, uint32_t size)
     if (!elu_params)
         return ENOMEM;
 
-    shard_X = l1_alloc(shard_len * sizeof(float16));
-    if (!shard_X)
+    elu_params->shard_X = (uintptr_t)l1_alloc(shard_len * sizeof(float16));
+    if (!elu_params->shard_X)
         return ENOMEM;
 
-    shard_Y = l1_alloc(shard_len * sizeof(float16));
-    if (!shard_Y)
+    elu_params->shard_Y = (uintptr_t)l1_alloc(shard_len * sizeof(float16));
+    if (!elu_params->shard_Y)
         return ENOMEM;
 
-    alpha = l1_alloc(sizeof(float16));
-    if (!alpha)
+    elu_params->alpha = (uintptr_t)l1_alloc(sizeof(float16));
+    if (!elu_params->alpha)
         return ENOMEM;
 
-    elu_params->shard_X = shard_X;
-    elu_params->shard_Y = shard_Y;
-    elu_params->alpha   = alpha;
-    elu_params->start   = shard_start;
-    elu_params->end     = shard_end;
-    elu_params->len     = shard_len;
+    elu_params->start = shard_start;
+    elu_params->end   = shard_start + shard_len;
+    elu_params->len   = shard_len;
 
     *params = (void *)elu_params;
 
@@ -69,91 +55,37 @@ static int allocate_l1(void **params, uint32_t size)
 
 static int init_input_params(void *params, const float16 *X, float16 a)
 {
-    volatile elu_fp16_spatz_params_t *elu_params;
-    uint32_t start;
-    uint32_t len;
-
-    elu_params = (volatile elu_fp16_spatz_params_t *)params;
-    start      = elu_params->start;
-    len        = elu_params->len;
+    volatile elu_fp16_spatz_params_t *elu_params = params;
 
     mmio_fp16(elu_params->alpha) = a;
 
-    if (len == 0)
+    if (elu_params->len == 0)
         return 0;
 
     /* This tile's slice [start, start+len) is contiguous in L2. The Spatz task writes every
        output (Y = elu(X, alpha)), so shard_Y is not zeroed here. */
-    idma_memcpy_1d(0, (uint32_t)(X + start), (uint32_t)elu_params->shard_X, len * sizeof(float16));
-    eu_idma_wait_a2o(WFE);
+    mg_idma_memcpy_1d_sync(WFE,
+                           0,
+                           (uint32_t)(X + elu_params->start),
+                           elu_params->shard_X,
+                           elu_params->len * sizeof(float16));
 
     return 0;
 }
 
-static int offload_spatz_task(void *params)
-{
-    int ret;
-
-    spatz_run_task_with_params(ELU_FP16_SPATZ_TASK, params);
-
-    ret = eu_spatz_wait(WFE);
-    if (ret == 0) {
-        printf("[CV32 (%d)] [%s] Wait on Spatz task completion failed with error: %d\n",
-               HID,
-               KERNEL_NAME,
-               ret);
-        goto exit;
-    }
-
-    ret = spatz_get_exit_code();
-
-exit:
-    return ret;
-}
-
-/*
- * Y = elu(X, alpha) on this tile's Spatz, for operands that are already in this tile's L1: no
- * sharding across tiles, no L1 allocation and no L2 transfers. Y may alias X.
- */
-void MAGIA_elu_fp16_spatz_l1(const float16 *X, float16 *Y, uint32_t size, float16 alpha)
-{
-    volatile float16 alpha_val              = alpha;
-    volatile elu_fp16_spatz_params_t params = {
-        .shard_X = (uintptr_t)X,
-        .shard_Y = (uintptr_t)Y,
-        .alpha   = (uintptr_t)&alpha_val,
-        .start   = 0,
-        .end     = size,
-        .len     = size,
-    };
-    int ret;
-
-    ret = offload_spatz_task((void *)&params);
-    if (ret != 0) {
-        printf("[CV32 (%d)] [%s] Spatz task offloading failed with error: %d\n",
-               HID,
-               KERNEL_NAME,
-               ret);
-    }
-}
-
 static int store_result(void *params, float16 *dst)
 {
-    volatile elu_fp16_spatz_params_t *elu_params;
-    uint32_t start;
-    uint32_t len;
+    volatile elu_fp16_spatz_params_t *elu_params = params;
 
-    elu_params = (volatile elu_fp16_spatz_params_t *)params;
-    start      = elu_params->start;
-    len        = elu_params->len;
-
-    if (len == 0)
+    if (elu_params->len == 0)
         return 0;
 
     /* This tile's output slice [start, start+len) is contiguous in L2. */
-    idma_memcpy_1d(
-        1, (uint32_t)(dst + start), (uint32_t)elu_params->shard_Y, len * sizeof(float16));
-    eu_idma_wait_o2a(WFE);
+    mg_idma_memcpy_1d_sync(WFE,
+                           1,
+                           (uint32_t)(dst + elu_params->start),
+                           elu_params->shard_Y,
+                           elu_params->len * sizeof(float16));
 
     return 0;
 }
@@ -163,29 +95,54 @@ void MAGIA_elu_fp16_spatz(const float16 *X, float16 *Y, uint32_t size, float16 a
     int ret;
     volatile elu_fp16_spatz_params_t *params;
 
-    PROF_PHASE(prof_cyc_alloc, ret, allocate_l1(&params, size));
+    PROF_PHASE(prof_cyc_alloc, ret, allocate_l1((void **)&params, size));
     if (ret != 0) {
         printf("[CV32 (%d)] [%s] L1 allocation failed with error: %d\n", HID, KERNEL_NAME, ret);
         return;
     }
 
-    PROF_PHASE(prof_cyc_data_in, ret, init_input_params(params, X, alpha));
+    PROF_PHASE(prof_cyc_data_in, ret, init_input_params((void *)params, X, alpha));
     if (ret != 0) {
-        printf("[CV32 (%d) Params initialization failed with error: %d\n]", HID, KERNEL_NAME, ret);
-        return;
-    }
-
-    PROF_PHASE(prof_cyc_compute, ret, offload_spatz_task(params));
-    if (ret != 0) {
-        printf("[CV32 (%d)] [%s] Spatz task offloading failed with error: %d\n",
+        printf("[CV32 (%d)] [%s] Params initialization failed with error: %d\n",
                HID,
                KERNEL_NAME,
                ret);
         return;
     }
 
-    PROF_PHASE(prof_cyc_data_out, ret, store_result(params, Y));
+    PROF_PHASE(prof_cyc_compute, ret, mg_spatz_call(ELU_FP16_SPATZ_TASK, (const void *)params));
+    if (ret != 0) {
+        printf("[CV32 (%d)] [%s] Spatz task failed with exit code: %d\n", HID, KERNEL_NAME, ret);
+        return;
+    }
+
+    PROF_PHASE(prof_cyc_data_out, ret, store_result((void *)params, Y));
     if (ret != 0) {
         printf("[CV32 (%d)] [%s] Result write back failed with error: %d\n", HID, KERNEL_NAME, ret);
     }
+}
+
+void MAGIA_elu_fp16_spatz_l1_start(elu_fp16_spatz_params_t *p,
+                                   const float16 *X,
+                                   float16 *Y,
+                                   uint32_t size,
+                                   float16 alpha,
+                                   mg_event_t *event)
+{
+    elu_fp16_spatz_params_set(p, X, Y, size, alpha);
+    mg_spatz_run(WFE, ELU_FP16_SPATZ_TASK, p, event, 0);
+}
+
+void MAGIA_elu_fp16_spatz_l1(const float16 *X, float16 *Y, uint32_t size, float16 alpha)
+{
+    elu_fp16_spatz_params_t params;
+    mg_event_t event;
+
+    MAGIA_elu_fp16_spatz_l1_start(&params, X, Y, size, alpha, &event);
+    mg_spatz_wait(WFE, &event);
+    if (mg_spatz_exit_code() != 0)
+        printf("[CV32 (%d)] [%s] Spatz task failed with exit code: %d\n",
+               HID,
+               KERNEL_NAME,
+               mg_spatz_exit_code());
 }

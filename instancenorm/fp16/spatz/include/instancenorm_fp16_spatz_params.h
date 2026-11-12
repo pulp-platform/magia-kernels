@@ -19,6 +19,7 @@ typedef struct {
     uint32_t inst_len;     /* Number of instances for this tile       */
     uint32_t hw_len;       /* Elements per instance (H * W)           */
     uint32_t num_channels; /* Total number of channels (C)            */
+    _Float16 eps_l1;       /* Storage for eps (L1 API)                */
 } instancenorm_fp16_spatz_params_t;
 
 #endif /* INSTANCENORM_FP16_SPATZ_PARAMS_H_ */

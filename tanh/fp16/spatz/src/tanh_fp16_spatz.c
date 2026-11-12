@@ -5,14 +5,14 @@
 #include <stdint.h>
 #include <errno.h>
 
-#include "eventunit.h"
-#include "idma.h"
 #include "tile.h"
+#include "mg_idma.h"
+#include "mg_spatz.h"
+#include "mg_tile.h"
 
 #include "kernels_profiling_utils.h"
 
 #include "tanh_fp16_spatz.h"
-#include "tanh_fp16_spatz_params.h"
 #include "tanh_fp16_spatz_task_bin.h"
 
 #define HID         get_hartid()
@@ -21,20 +21,10 @@
 static int alloc_l1(void **params, uint32_t size)
 {
     volatile tanh_fp16_spatz_params_t *tanh_params;
-    uintptr_t shard_input;
-    uintptr_t shard_output;
-
-    uint32_t shard;
-    uint32_t left;
     uint32_t start;
-    uint32_t end;
     uint32_t len;
 
-    shard = size / NUM_HARTS;
-    left  = size % NUM_HARTS;
-    start = HID * shard + (HID < left ? HID : left);
-    end   = start + shard + (HID < left ? 1 : 0);
-    len   = end - start;
+    mg_split(size, NUM_HARTS, HID, &start, &len);
 
     l1_alloc_init();
 
@@ -42,19 +32,17 @@ static int alloc_l1(void **params, uint32_t size)
     if (!tanh_params)
         return ENOMEM;
 
-    shard_input = l1_alloc(len * sizeof(float16));
-    if (!shard_input)
+    tanh_params->shard_input = (uintptr_t)l1_alloc(len * sizeof(float16));
+    if (!tanh_params->shard_input)
         return ENOMEM;
 
-    shard_output = l1_alloc(len * sizeof(float16));
-    if (!shard_output)
+    tanh_params->shard_output = (uintptr_t)l1_alloc(len * sizeof(float16));
+    if (!tanh_params->shard_output)
         return ENOMEM;
 
-    tanh_params->shard_input  = shard_input;
-    tanh_params->shard_output = shard_output;
-    tanh_params->start        = start;
-    tanh_params->len          = len;
-    tanh_params->end          = end;
+    tanh_params->start = start;
+    tanh_params->len   = len;
+    tanh_params->end   = start + len;
 
     *params = (void *)tanh_params;
 
@@ -63,88 +51,35 @@ static int alloc_l1(void **params, uint32_t size)
 
 static int init_input_params(void *params, const float16 *input)
 {
-    volatile tanh_fp16_spatz_params_t *tanh_params;
-    uint32_t start;
-    uint32_t len;
+    volatile tanh_fp16_spatz_params_t *tanh_params = params;
 
-    tanh_params = (volatile tanh_fp16_spatz_params_t *)params;
-    start       = tanh_params->start;
-    len         = tanh_params->len;
-
-    if (len == 0)
+    if (tanh_params->len == 0)
         return 0;
 
     /* This tile's slice [start, start+len) is contiguous in L2. The Spatz task writes every
-       output (Y = tanh(X)), so shard_output is not zeroed here. */
-    idma_memcpy_1d(
-        0, (uint32_t)(input + start), (uint32_t)tanh_params->shard_input, len * sizeof(float16));
-    eu_idma_wait_a2o(WFE);
+       output (output = tanh(input)), so shard_output is not zeroed here. */
+    mg_idma_memcpy_1d_sync(WFE,
+                           0,
+                           (uint32_t)(input + tanh_params->start),
+                           tanh_params->shard_input,
+                           tanh_params->len * sizeof(float16));
 
     return 0;
 }
 
-static int offload_spatz_task(void *params)
-{
-    int ret;
-
-    spatz_run_task_with_params(TANH_FP16_SPATZ_TASK, (uint32_t)params);
-
-    ret = eu_spatz_wait(WFE);
-    if (ret == 0) {
-        printf("[CV32 (%d)] [%s] Wait on Spatz task completion failed with error: %d\n",
-               HID,
-               KERNEL_NAME,
-               ret);
-        goto exit;
-    }
-
-    ret = spatz_get_exit_code();
-
-exit:
-    return ret;
-}
-
-/*
- * output = tanh(input) on this tile's Spatz, for operands that are already in this tile's L1: no
- * sharding across tiles, no L1 allocation and no L2 transfers. output may alias input.
- */
-void MAGIA_tanh_fp16_spatz_l1(const float16 *input, float16 *output, uint32_t size)
-{
-    volatile tanh_fp16_spatz_params_t params = {
-        .shard_input  = (uintptr_t)input,
-        .shard_output = (uintptr_t)output,
-        .start        = 0,
-        .end          = size,
-        .len          = size,
-    };
-    int ret;
-
-    ret = offload_spatz_task((void *)&params);
-    if (ret != 0) {
-        printf("[CV32 (%d)] [%s] Spatz task offloading failed with error: %d\n",
-               HID,
-               KERNEL_NAME,
-               ret);
-    }
-}
-
 static int store_result(void *params, float16 *dst)
 {
-    volatile tanh_fp16_spatz_params_t *tanh_params;
-    uint32_t start;
-    uint32_t len;
+    volatile tanh_fp16_spatz_params_t *tanh_params = params;
 
-    tanh_params = (volatile tanh_fp16_spatz_params_t *)params;
-    start       = tanh_params->start;
-    len         = tanh_params->len;
-
-    if (len == 0)
+    if (tanh_params->len == 0)
         return 0;
 
     /* This tile's output slice [start, start+len) is contiguous in L2. */
-    idma_memcpy_1d(
-        1, (uint32_t)(dst + start), (uint32_t)tanh_params->shard_output, len * sizeof(float16));
-    eu_idma_wait_o2a(WFE);
+    mg_idma_memcpy_1d_sync(WFE,
+                           1,
+                           (uint32_t)(dst + tanh_params->start),
+                           tanh_params->shard_output,
+                           tanh_params->len * sizeof(float16));
 
     return 0;
 }
@@ -169,12 +104,9 @@ void MAGIA_tanh_fp16_spatz(const float16 *input, float16 *output, uint32_t size)
         return;
     }
 
-    PROF_PHASE(prof_cyc_compute, ret, offload_spatz_task((void *)params));
+    PROF_PHASE(prof_cyc_compute, ret, mg_spatz_call(TANH_FP16_SPATZ_TASK, (const void *)params));
     if (ret != 0) {
-        printf("[CV32 (%d)] [%s] Spatz task offloading failed with error: %d\n",
-               HID,
-               KERNEL_NAME,
-               ret);
+        printf("[CV32 (%d)] [%s] Spatz task failed with exit code: %d\n", HID, KERNEL_NAME, ret);
         return;
     }
 
@@ -182,4 +114,28 @@ void MAGIA_tanh_fp16_spatz(const float16 *input, float16 *output, uint32_t size)
     if (ret != 0) {
         printf("[CV32 (%d)] [%s] Result write back failed with error: %d\n", HID, KERNEL_NAME, ret);
     }
+}
+
+void MAGIA_tanh_fp16_spatz_l1_start(tanh_fp16_spatz_params_t *p,
+                                    const float16 *input,
+                                    float16 *output,
+                                    uint32_t size,
+                                    mg_event_t *event)
+{
+    tanh_fp16_spatz_params_set(p, input, output, size);
+    mg_spatz_run(WFE, TANH_FP16_SPATZ_TASK, p, event, 0);
+}
+
+void MAGIA_tanh_fp16_spatz_l1(const float16 *input, float16 *output, uint32_t size)
+{
+    tanh_fp16_spatz_params_t params;
+    mg_event_t event;
+
+    MAGIA_tanh_fp16_spatz_l1_start(&params, input, output, size, &event);
+    mg_spatz_wait(WFE, &event);
+    if (mg_spatz_exit_code() != 0)
+        printf("[CV32 (%d)] [%s] Spatz task failed with exit code: %d\n",
+               HID,
+               KERNEL_NAME,
+               mg_spatz_exit_code());
 }

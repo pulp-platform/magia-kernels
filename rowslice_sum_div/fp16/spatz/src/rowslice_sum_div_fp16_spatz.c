@@ -5,26 +5,16 @@
 #include <stdint.h>
 #include <errno.h>
 
-#include "eventunit.h"
-#include "idma.h"
 #include "tile.h"
+#include "mg_idma.h"
+#include "mg_spatz.h"
+#include "mg_tile.h"
 
 #include "rowslice_sum_div_fp16_spatz.h"
-#include "rowslice_sum_div_fp16_spatz_params.h"
 #include "rowslice_sum_div_fp16_spatz_task_bin.h"
 
 #define HID         get_hartid()
 #define KERNEL_NAME "rowslice_sum_div_fp16_spatz"
-
-/* This tile's rows [*row_start, *row_start + *row_len) out of rows. */
-static void tile_rows(uint32_t rows, uint32_t *row_start, uint32_t *row_len)
-{
-    uint32_t elems = rows / NUM_HARTS;
-    uint32_t left  = rows % NUM_HARTS;
-
-    *row_start = HID * elems + (HID < left ? HID : left);
-    *row_len   = elems + (HID < left ? 1 : 0);
-}
 
 static int alloc_l1(void **params, uint32_t n, uint32_t own, uint32_t rows, uint32_t cols)
 {
@@ -36,7 +26,7 @@ static int alloc_l1(void **params, uint32_t n, uint32_t own, uint32_t rows, uint
     uint32_t row_start;
     uint32_t row_len;
 
-    tile_rows(rows, &row_start, &row_len);
+    mg_split(rows, NUM_HARTS, HID, &row_start, &row_len);
 
     l1_alloc_init();
 
@@ -84,82 +74,35 @@ init_input_params(void *params, const float16 *O, const float16 *G, const float1
     rd_params = (volatile rowslice_sum_div_fp16_spatz_params_t *)params;
     cols      = rd_params->dims >> 16;
     n         = rd_params->slices & 0xffff;
-    tile_rows(rows, &row_start, &row_len);
+    mg_split(rows, NUM_HARTS, HID, &row_start, &row_len);
 
     if (row_len == 0)
         return 0;
 
-    idma_memcpy_1d(0,
-                   (uint32_t)(O + row_start * cols),
-                   (uint32_t)rd_params->shard_O,
-                   row_len * cols * sizeof(float16));
-    eu_idma_wait_a2o(WFE);
+    mg_idma_memcpy_1d_sync(WFE,
+                           0,
+                           (uint32_t)(O + row_start * cols),
+                           (uint32_t)rd_params->shard_O,
+                           row_len * cols * sizeof(float16));
 
     /* This tile's rows of each of the n slices, packed into an n x row_len x cols block. */
     if (n > 0) {
-        idma_memcpy_2d(0,
-                       (uint32_t)(G + row_start * cols),
-                       (uint32_t)rd_params->shard_G,
-                       row_len * cols * sizeof(float16),
-                       rows * cols * sizeof(float16),
-                       n);
-        eu_idma_wait_a2o(WFE);
+        mg_idma_memcpy_2d_sync(WFE,
+                               0,
+                               (uint32_t)(G + row_start * cols),
+                               (uint32_t)rd_params->shard_G,
+                               row_len * cols * sizeof(float16),
+                               rows * cols * sizeof(float16),
+                               n);
     }
 
-    idma_memcpy_1d(
-        0, (uint32_t)(S + row_start), (uint32_t)rd_params->shard_S, row_len * sizeof(float16));
-    eu_idma_wait_a2o(WFE);
+    mg_idma_memcpy_1d_sync(WFE,
+                           0,
+                           (uint32_t)(S + row_start),
+                           (uint32_t)rd_params->shard_S,
+                           row_len * sizeof(float16));
 
     return 0;
-}
-
-static int offload_spatz_task(void *params)
-{
-    int ret;
-
-    spatz_run_task_with_params(ROWSLICE_SUM_DIV_FP16_SPATZ_TASK, (uint32_t)params);
-
-    ret = eu_spatz_wait(WFE);
-    if (ret == 0) {
-        printf("[CV32 (%d)] [%s] Wait on Spatz task completion failed with error: %d\n",
-               HID,
-               KERNEL_NAME,
-               ret);
-        goto exit;
-    }
-
-    ret = spatz_get_exit_code();
-
-exit:
-    return ret;
-}
-
-void MAGIA_rowslice_sum_div_fp16_spatz_l1(float16 *Y,
-                                          const float16 *O,
-                                          const float16 *G,
-                                          const float16 *S,
-                                          uint32_t n,
-                                          uint32_t own,
-                                          uint32_t rows,
-                                          uint32_t cols)
-{
-    volatile rowslice_sum_div_fp16_spatz_params_t params = {
-        .shard_Y = (uintptr_t)Y,
-        .shard_O = (uintptr_t)O,
-        .shard_G = (uintptr_t)G,
-        .shard_S = (uintptr_t)S,
-        .dims    = rows | (cols << 16),
-        .slices  = n | (own << 16),
-    };
-    int ret;
-
-    ret = offload_spatz_task((void *)&params);
-    if (ret != 0) {
-        printf("[CV32 (%d)] [%s] Spatz task offloading failed with error: %d\n",
-               HID,
-               KERNEL_NAME,
-               ret);
-    }
 }
 
 static int store_result(void *params, float16 *Y, uint32_t rows)
@@ -171,16 +114,16 @@ static int store_result(void *params, float16 *Y, uint32_t rows)
 
     rd_params = (volatile rowslice_sum_div_fp16_spatz_params_t *)params;
     cols      = rd_params->dims >> 16;
-    tile_rows(rows, &row_start, &row_len);
+    mg_split(rows, NUM_HARTS, HID, &row_start, &row_len);
 
     if (row_len == 0)
         return 0;
 
-    idma_memcpy_1d(1,
-                   (uint32_t)(Y + row_start * cols),
-                   (uint32_t)rd_params->shard_Y,
-                   row_len * cols * sizeof(float16));
-    eu_idma_wait_o2a(WFE);
+    mg_idma_memcpy_1d_sync(WFE,
+                           1,
+                           (uint32_t)(Y + row_start * cols),
+                           (uint32_t)rd_params->shard_Y,
+                           row_len * cols * sizeof(float16));
 
     return 0;
 }
@@ -212,12 +155,9 @@ void MAGIA_rowslice_sum_div_fp16_spatz(float16 *Y,
         return;
     }
 
-    ret = offload_spatz_task((void *)params);
+    ret = mg_spatz_call(ROWSLICE_SUM_DIV_FP16_SPATZ_TASK, (const void *)params);
     if (ret != 0) {
-        printf("[CV32 (%d)] [%s] Spatz task offloading failed with error: %d\n",
-               HID,
-               KERNEL_NAME,
-               ret);
+        printf("[CV32 (%d)] [%s] Spatz task failed with exit code: %d\n", HID, KERNEL_NAME, ret);
         return;
     }
 
@@ -225,4 +165,40 @@ void MAGIA_rowslice_sum_div_fp16_spatz(float16 *Y,
     if (ret != 0) {
         printf("[CV32 (%d)] [%s] Result write back failed with error: %d\n", HID, KERNEL_NAME, ret);
     }
+}
+
+void MAGIA_rowslice_sum_div_fp16_spatz_l1_start(rowslice_sum_div_fp16_spatz_params_t *p,
+                                                float16 *Y,
+                                                const float16 *O,
+                                                const float16 *G,
+                                                const float16 *S,
+                                                uint32_t n,
+                                                uint32_t own,
+                                                uint32_t rows,
+                                                uint32_t cols,
+                                                mg_event_t *event)
+{
+    rowslice_sum_div_fp16_spatz_params_set(p, Y, O, G, S, n, own, rows, cols);
+    mg_spatz_run(WFE, ROWSLICE_SUM_DIV_FP16_SPATZ_TASK, p, event, 0);
+}
+
+void MAGIA_rowslice_sum_div_fp16_spatz_l1(float16 *Y,
+                                          const float16 *O,
+                                          const float16 *G,
+                                          const float16 *S,
+                                          uint32_t n,
+                                          uint32_t own,
+                                          uint32_t rows,
+                                          uint32_t cols)
+{
+    rowslice_sum_div_fp16_spatz_params_t params;
+    mg_event_t event;
+
+    MAGIA_rowslice_sum_div_fp16_spatz_l1_start(&params, Y, O, G, S, n, own, rows, cols, &event);
+    mg_spatz_wait(WFE, &event);
+    if (mg_spatz_exit_code() != 0)
+        printf("[CV32 (%d)] [%s] Spatz task failed with exit code: %d\n",
+               HID,
+               KERNEL_NAME,
+               mg_spatz_exit_code());
 }

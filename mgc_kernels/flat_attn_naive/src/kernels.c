@@ -13,6 +13,8 @@
 #define MGC_GLUE
 #include "mgc_flat_attn_naive.h"
 #include "tile.h"
+#include "mg_spatz.h"
+#include "mg_tile.h"
 #include "add_fp16_spatz.h"
 #include "exp_fp16_spatz.h"
 #include "expminus_fp16_spatz.h"
@@ -26,30 +28,14 @@
 #include "rowscale_fp16_spatz.h"
 #include "sub_fp16_spatz.h"
 #include "eventunit.h"
+#define SPATZ_BINARY_NO_DEFINE
 #include "flat_attn_naive_spatz_task_bin.h"
-
-/* Per-tile flag: set once Spatz has been set up on this tile (before its first task). */
-static volatile uint8_t spatz_ready __attribute__((section(".tile_bss")));
-
-/**
- * Lazy Spatz setup on this tile (event unit line, binary and clock): the mgc-generated main
- * does not know about Spatz.
- */
-static void spatz_setup(void)
-{
-    if (spatz_ready)
-        return;
-    eu_spatz_init(0);
-    spatz_init(SPATZ_BINARY_START);
-    spatz_ready = 1;
-}
 
 /**
  * y[k] = 0 for `n` fp16 elements, on this tile's Spatz.
  */
 void l1_memset_zero_fp16_spatz(uint32_t y, uint32_t n)
 {
-    spatz_setup();
     MAGIA_memset_zero_fp16_spatz_l1((float16 *)y, n);
 }
 
@@ -73,8 +59,7 @@ void l1_copy_fp16(uint32_t y, uint32_t x, uint32_t n)
  */
 void l1_scale_rsqrt_p_fp16_spatz(uint32_t y, uint32_t x, uint32_t n)
 {
-    spatz_setup();
-    volatile float16 r = (float16)((union { uint16_t u; float16 f; }){.u = QK_SCALE_FP16}.f);
+    volatile float16 r = mg_fp16_from_bits(QK_SCALE_FP16);
     MAGIA_mul_broadcast_fp16_spatz_l1((const float16 *)x, (const float16 *)&r, (float16 *)y, n);
 }
 
@@ -83,7 +68,6 @@ void l1_scale_rsqrt_p_fp16_spatz(uint32_t y, uint32_t x, uint32_t n)
  */
 void l1_rowmax_fp16_spatz(uint32_t m, uint32_t x, uint32_t rows, uint32_t cols)
 {
-    spatz_setup();
     MAGIA_reducemax_fp16_spatz_l1((const float16 *)x, (float16 *)m, rows, cols, 1);
 }
 
@@ -92,7 +76,6 @@ void l1_rowmax_fp16_spatz(uint32_t m, uint32_t x, uint32_t rows, uint32_t cols)
  */
 void l1_max_fp16_spatz(uint32_t y, uint32_t a, uint32_t b, uint32_t n)
 {
-    spatz_setup();
     MAGIA_max_fp16_spatz_l1((const float16 *)a, (const float16 *)b, (float16 *)y, n);
 }
 
@@ -102,7 +85,6 @@ void l1_max_fp16_spatz(uint32_t y, uint32_t a, uint32_t b, uint32_t n)
  */
 void l1_colmax_fp16_spatz(uint32_t m, uint32_t x, uint32_t rows, uint32_t cols)
 {
-    spatz_setup();
     MAGIA_reducemax_fp16_spatz_l1((const float16 *)x, (float16 *)m, 1, rows, cols);
 }
 
@@ -111,7 +93,6 @@ void l1_colmax_fp16_spatz(uint32_t m, uint32_t x, uint32_t rows, uint32_t cols)
  */
 void l1_rowsum_fp16_spatz(uint32_t s, uint32_t x, uint32_t rows, uint32_t cols)
 {
-    spatz_setup();
     MAGIA_reducesum_fp16_spatz_l1((const float16 *)x, (float16 *)s, rows, cols, 1);
 }
 
@@ -121,7 +102,6 @@ void l1_rowsum_fp16_spatz(uint32_t s, uint32_t x, uint32_t rows, uint32_t cols)
  */
 void l1_colsum_fp16_spatz(uint32_t s, uint32_t x, uint32_t rows, uint32_t cols)
 {
-    spatz_setup();
     MAGIA_reducesum_fp16_spatz_l1((const float16 *)x, (float16 *)s, 1, rows, cols);
 }
 
@@ -130,7 +110,6 @@ void l1_colsum_fp16_spatz(uint32_t s, uint32_t x, uint32_t rows, uint32_t cols)
  */
 void l1_expminus_fp16_spatz(uint32_t y, uint32_t x, uint32_t m, uint32_t rows, uint32_t cols)
 {
-    spatz_setup();
     MAGIA_expminus_fp16_spatz_l1((const float16 *)x, (const float16 *)m, (float16 *)y, rows, cols);
 }
 
@@ -139,7 +118,6 @@ void l1_expminus_fp16_spatz(uint32_t y, uint32_t x, uint32_t m, uint32_t rows, u
  */
 void l1_sub_fp16_spatz(uint32_t y, uint32_t a, uint32_t b, uint32_t n)
 {
-    spatz_setup();
     MAGIA_sub_fp16_spatz_l1((const float16 *)a, (const float16 *)b, (float16 *)y, n);
 }
 
@@ -148,7 +126,6 @@ void l1_sub_fp16_spatz(uint32_t y, uint32_t a, uint32_t b, uint32_t n)
  */
 void l1_exp_fp16_spatz(uint32_t y, uint32_t x, uint32_t n)
 {
-    spatz_setup();
     MAGIA_exp_fp16_spatz_l1((const float16 *)x, (float16 *)y, n);
 }
 
@@ -157,7 +134,6 @@ void l1_exp_fp16_spatz(uint32_t y, uint32_t x, uint32_t n)
  */
 void l1_mul_fp16_spatz(uint32_t y, uint32_t a, uint32_t b, uint32_t n)
 {
-    spatz_setup();
     MAGIA_mul_fp16_spatz_l1((const float16 *)a, (const float16 *)b, (float16 *)y, n);
 }
 
@@ -166,7 +142,6 @@ void l1_mul_fp16_spatz(uint32_t y, uint32_t a, uint32_t b, uint32_t n)
  */
 void l1_add_fp16_spatz(uint32_t y, uint32_t a, uint32_t b, uint32_t n)
 {
-    spatz_setup();
     MAGIA_add_fp16_spatz_l1((const float16 *)a, (const float16 *)b, (float16 *)y, n);
 }
 
@@ -176,7 +151,6 @@ void l1_add_fp16_spatz(uint32_t y, uint32_t a, uint32_t b, uint32_t n)
  */
 void l1_rowscale_fp16_spatz(uint32_t y, uint32_t x, uint32_t s, uint32_t rows, uint32_t cols)
 {
-    spatz_setup();
     MAGIA_rowscale_fp16_spatz_l1((const float16 *)x, (const float16 *)s, (float16 *)y, rows, cols);
 }
 
@@ -186,6 +160,5 @@ void l1_rowscale_fp16_spatz(uint32_t y, uint32_t x, uint32_t s, uint32_t rows, u
  */
 void l1_rowdiv_fp16_spatz(uint32_t y, uint32_t x, uint32_t s, uint32_t rows, uint32_t cols)
 {
-    spatz_setup();
     MAGIA_rowdiv_fp16_spatz_l1((const float16 *)x, (const float16 *)s, (float16 *)y, rows, cols);
 }

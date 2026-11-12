@@ -5,14 +5,14 @@
 #include <stdint.h>
 #include <errno.h>
 
-#include "eventunit.h"
-#include "idma.h"
 #include "tile.h"
+#include "mg_idma.h"
+#include "mg_spatz.h"
+#include "mg_tile.h"
 
 #include "kernels_profiling_utils.h"
 
 #include "resize_fp16_spatz.h"
-#include "resize_fp16_spatz_params.h"
 #include "resize_fp16_spatz_task_bin.h"
 
 #define HID         get_hartid()
@@ -30,20 +30,10 @@ static int alloc_l1(void **params,
     uintptr_t shard_X;
     uintptr_t shard_Y;
 
-    size_t it_start;
-    size_t it_end;
-    size_t it_len;
-    size_t elems;
-    size_t left;
-    size_t total_iterations;
+    uint32_t it_start;
+    uint32_t it_len;
 
-    total_iterations = batch_size * channels;
-    elems            = total_iterations / NUM_HARTS;
-    left             = total_iterations % NUM_HARTS;
-
-    it_start = HID * elems + (HID < left ? HID : left);
-    it_end   = it_start + elems + (HID < left ? 1 : 0);
-    it_len   = it_end - it_start;
+    mg_split(batch_size * channels, NUM_HARTS, HID, &it_start, &it_len);
 
     l1_alloc_init();
 
@@ -90,68 +80,13 @@ static int init_input_params(void *params, const float16 *X)
 
     /* This tile's (batch,channel) planes [it_start, it_start+it_len) are contiguous in L2.
        The Spatz task writes every output pixel, so shard_Y is not zeroed here. */
-    idma_memcpy_1d(0,
-                   (uint32_t)(X + it_start * in_hw),
-                   (uint32_t)resize_params->shard_X,
-                   it_len * in_hw * sizeof(float16));
-    eu_idma_wait_a2o(WFE);
+    mg_idma_memcpy_1d_sync(WFE,
+                           0,
+                           (uint32_t)(X + it_start * in_hw),
+                           resize_params->shard_X,
+                           it_len * in_hw * sizeof(float16));
 
     return 0;
-}
-
-static int offload_spatz_task(void *params)
-{
-    int ret;
-
-    spatz_run_task_with_params(RESIZE_FP16_SPATZ_TASK, params);
-
-    ret = eu_spatz_wait(WFE);
-    if (ret == 0) {
-        printf("[CV32 (%d)] [%s] Wait on Spatz task completion failed with error: %d\n",
-               HID,
-               KERNEL_NAME,
-               ret);
-        goto exit;
-    }
-
-    ret = spatz_get_exit_code();
-
-exit:
-    return ret;
-}
-
-/*
- * Nearest-neighbour Resize of NCHW planes on this tile's Spatz, for operands already in this
- * tile's L1: no sharding across tiles, no L1 allocation and no L2 transfers.
- */
-void MAGIA_resize_fp16_spatz_l1(const float16 *X,
-                                float16 *Y,
-                                uint32_t batch_size,
-                                uint32_t channels,
-                                uint32_t in_h,
-                                uint32_t in_w,
-                                uint32_t out_h,
-                                uint32_t out_w)
-{
-    volatile resize_fp16_spatz_params_t params = {
-        .shard_X         = (uintptr_t)X,
-        .shard_Y         = (uintptr_t)Y,
-        .in_h            = in_h,
-        .in_w            = in_w,
-        .out_h           = out_h,
-        .out_w           = out_w,
-        .iteration_start = 0,
-        .iteration_len   = batch_size * channels,
-    };
-    int ret;
-
-    ret = offload_spatz_task((void *)&params);
-    if (ret != 0) {
-        printf("[CV32 (%d)] [%s] Spatz task offloading failed with error: %d\n",
-               HID,
-               KERNEL_NAME,
-               ret);
-    }
 }
 
 static int store_result(void *params, float16 *Y)
@@ -170,11 +105,11 @@ static int store_result(void *params, float16 *Y)
         return 0;
 
     /* This tile's output (batch,channel) planes [it_start, it_start+it_len) are contiguous. */
-    idma_memcpy_1d(1,
-                   (uint32_t)(Y + it_start * out_hw),
-                   (uint32_t)resize_params->shard_Y,
-                   it_len * out_hw * sizeof(float16));
-    eu_idma_wait_o2a(WFE);
+    mg_idma_memcpy_1d_sync(WFE,
+                           1,
+                           (uint32_t)(Y + it_start * out_hw),
+                           resize_params->shard_Y,
+                           it_len * out_hw * sizeof(float16));
 
     return 0;
 }
@@ -191,14 +126,15 @@ void MAGIA_resize_fp16_spatz(const float16 *X,
     int ret;
     volatile resize_fp16_spatz_params_t *params;
 
-    PROF_PHASE(
-        prof_cyc_alloc, ret, alloc_l1(&params, batch_size, channels, in_h, in_w, out_h, out_w));
+    PROF_PHASE(prof_cyc_alloc,
+               ret,
+               alloc_l1((void **)&params, batch_size, channels, in_h, in_w, out_h, out_w));
     if (ret != 0) {
         printf("[CV32 (%d)] [%s] L1 allocation failed with error: %d\n", HID, KERNEL_NAME, ret);
         return;
     }
 
-    PROF_PHASE(prof_cyc_data_in, ret, init_input_params(params, X));
+    PROF_PHASE(prof_cyc_data_in, ret, init_input_params((void *)params, X));
     if (ret != 0) {
         printf("[CV32 (%d)] [%s] Params initialization failed with error: %d\n",
                HID,
@@ -207,17 +143,51 @@ void MAGIA_resize_fp16_spatz(const float16 *X,
         return;
     }
 
-    PROF_PHASE(prof_cyc_compute, ret, offload_spatz_task(params));
+    PROF_PHASE(prof_cyc_compute, ret, mg_spatz_call(RESIZE_FP16_SPATZ_TASK, (const void *)params));
     if (ret != 0) {
-        printf("[CV32 (%d)] [%s] Spatz task offloading failed with error: %d\n",
-               HID,
-               KERNEL_NAME,
-               ret);
+        printf("[CV32 (%d)] [%s] Spatz task failed with exit code: %d\n", HID, KERNEL_NAME, ret);
         return;
     }
 
-    PROF_PHASE(prof_cyc_data_out, ret, store_result(params, Y));
+    PROF_PHASE(prof_cyc_data_out, ret, store_result((void *)params, Y));
     if (ret != 0) {
         printf("[CV32 (%d)] [%s] Result write back failed with error: %d\n", HID, KERNEL_NAME, ret);
     }
+}
+
+void MAGIA_resize_fp16_spatz_l1_start(resize_fp16_spatz_params_t *p,
+                                      const float16 *X,
+                                      float16 *Y,
+                                      uint32_t batch_size,
+                                      uint32_t channels,
+                                      uint32_t in_h,
+                                      uint32_t in_w,
+                                      uint32_t out_h,
+                                      uint32_t out_w,
+                                      mg_event_t *event)
+{
+    resize_fp16_spatz_params_set(p, X, Y, batch_size, channels, in_h, in_w, out_h, out_w);
+    mg_spatz_run(WFE, RESIZE_FP16_SPATZ_TASK, p, event, 0);
+}
+
+void MAGIA_resize_fp16_spatz_l1(const float16 *X,
+                                float16 *Y,
+                                uint32_t batch_size,
+                                uint32_t channels,
+                                uint32_t in_h,
+                                uint32_t in_w,
+                                uint32_t out_h,
+                                uint32_t out_w)
+{
+    resize_fp16_spatz_params_t params;
+    mg_event_t event;
+
+    MAGIA_resize_fp16_spatz_l1_start(
+        &params, X, Y, batch_size, channels, in_h, in_w, out_h, out_w, &event);
+    mg_spatz_wait(WFE, &event);
+    if (mg_spatz_exit_code() != 0)
+        printf("[CV32 (%d)] [%s] Spatz task failed with exit code: %d\n",
+               HID,
+               KERNEL_NAME,
+               mg_spatz_exit_code());
 }

@@ -56,8 +56,8 @@ WAIT_MODE = define(WFE)
 # im2col_start: starts the im2col of the CONV_CP pixels of output row `row` from column x0 on Spatz
 # (kernels/im2col), from the input rows that stage 0 loaded, and returns; spatz_wait(col) waits for it
 im2col_start = l1_kernel("l1_im2col_start_fp16_spatz", operands=("col:out", "x:in"), params=(), args=("row", "x0"),
-                         executor=CORE)
-spatz_wait = l1_kernel("l1_spatz_wait1", operands=("x:out",), params=(), executor=CORE)
+                         executor=SPATZ)
+spatz_wait = l1_kernel("l1_spatz_wait1", operands=("x:out",), params=(), executor=SPATZ)
 
 
 @kernel("mgc_conv_im2col", check=(y_, y_gold), tol=0x11)

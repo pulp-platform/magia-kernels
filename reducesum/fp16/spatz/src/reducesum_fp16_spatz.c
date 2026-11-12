@@ -5,12 +5,12 @@
 #include <stdint.h>
 #include <errno.h>
 
-#include "eventunit.h"
-#include "idma.h"
 #include "tile.h"
+#include "mg_idma.h"
+#include "mg_spatz.h"
+#include "mg_tile.h"
 
 #include "reducesum_fp16_spatz.h"
-#include "reducesum_fp16_spatz_params.h"
 #include "reducesum_fp16_spatz_task_bin.h"
 
 #define HID         get_hartid()
@@ -21,16 +21,9 @@ static int alloc_l1(void **params, uint32_t outer_dim, uint32_t reduce_dim, uint
     volatile reducesum_fp16_spatz_params_t *rm_params;
     uint32_t shard_X;
     uint32_t shard_Y;
+    uint32_t out_start, out_len;
 
-    size_t out_start, out_end, out_len;
-    size_t elems, left;
-
-    elems = outer_dim / NUM_HARTS;
-    left  = outer_dim % NUM_HARTS;
-
-    out_start = HID * elems + (HID < left ? HID : left);
-    out_end   = out_start + elems + (HID < left ? 1 : 0);
-    out_len   = out_end - out_start;
+    mg_split(outer_dim, NUM_HARTS, HID, &out_start, &out_len);
 
     l1_alloc_init();
 
@@ -59,8 +52,7 @@ static int alloc_l1(void **params, uint32_t outer_dim, uint32_t reduce_dim, uint
 
 static int init_input_params(void *params, const float16 *X)
 {
-    volatile reducesum_fp16_spatz_params_t *rm_params =
-        (volatile reducesum_fp16_spatz_params_t *)params;
+    volatile reducesum_fp16_spatz_params_t *rm_params = params;
     uint32_t src_base;
     uint32_t in_elems;
 
@@ -74,59 +66,15 @@ static int init_input_params(void *params, const float16 *X)
      * This tile's outer slice [outer_start, outer_start+outer_len) is contiguous in L2. The
      * Spatz task fully writes shard_Y (one sum per output), so it is not zeroed here.
      */
-    idma_memcpy_1d(
-        0, (uint32_t)(X + src_base), (uint32_t)rm_params->shard_X, in_elems * sizeof(float16));
-    eu_idma_wait_a2o(WFE);
+    mg_idma_memcpy_1d_sync(
+        WFE, 0, (uint32_t)(X + src_base), rm_params->shard_X, in_elems * sizeof(float16));
 
     return 0;
 }
 
-static int offload_spatz_task(void *params)
-{
-    int ret;
-
-    spatz_run_task_with_params(REDUCESUM_FP16_SPATZ_TASK, params);
-
-    ret = eu_spatz_wait(WFE);
-    if (ret == 0)
-        goto exit;
-
-    ret = spatz_get_exit_code();
-
-exit:
-    return ret;
-}
-
-/*
- * Y = sum of X over reduce_dim on this tile's Spatz, for operands that are already in this
- * tile's L1: no sharding across tiles, no L1 allocation and no L2 transfers.
- */
-void MAGIA_reducesum_fp16_spatz_l1(
-    const float16 *X, float16 *Y, uint32_t outer_len, uint32_t reduce_dim, uint32_t inner_dim)
-{
-    volatile reducesum_fp16_spatz_params_t params = {
-        .shard_X     = (uintptr_t)X,
-        .shard_Y     = (uintptr_t)Y,
-        .reduce_dim  = reduce_dim,
-        .inner_dim   = inner_dim,
-        .outer_start = 0,
-        .outer_len   = outer_len,
-    };
-    int ret;
-
-    ret = offload_spatz_task((void *)&params);
-    if (ret != 0) {
-        printf("[CV32 (%d)] [%s] Spatz task offloading failed with error: %d\n",
-               HID,
-               KERNEL_NAME,
-               ret);
-    }
-}
-
 static int store_result(void *params, float16 *Y)
 {
-    volatile reducesum_fp16_spatz_params_t *rm_params =
-        (volatile reducesum_fp16_spatz_params_t *)params;
+    volatile reducesum_fp16_spatz_params_t *rm_params = params;
     uint32_t dst_base;
     uint32_t out_elems;
 
@@ -137,9 +85,8 @@ static int store_result(void *params, float16 *Y)
     out_elems = rm_params->outer_len * rm_params->inner_dim;
 
     /* This tile's output outer slice is contiguous in L2. */
-    idma_memcpy_1d(
-        1, (uint32_t)(Y + dst_base), (uint32_t)rm_params->shard_Y, out_elems * sizeof(float16));
-    eu_idma_wait_o2a(WFE);
+    mg_idma_memcpy_1d_sync(
+        WFE, 1, (uint32_t)(Y + dst_base), rm_params->shard_Y, out_elems * sizeof(float16));
 
     return 0;
 }
@@ -150,13 +97,13 @@ void MAGIA_reducesum_fp16_spatz(
     int ret;
     volatile reducesum_fp16_spatz_params_t *params;
 
-    ret = alloc_l1(&params, outer_dim, reduce_dim, inner_dim);
+    ret = alloc_l1((void **)&params, outer_dim, reduce_dim, inner_dim);
     if (ret != 0) {
         printf("[CV32 (%d)] [%s] L1 allocation failed with error: %d\n", HID, KERNEL_NAME, ret);
         return;
     }
 
-    ret = init_input_params(params, X);
+    ret = init_input_params((void *)params, X);
     if (ret != 0) {
         printf("[CV32 (%d)] [%s] Params initialization failed with error: %d\n",
                HID,
@@ -165,17 +112,41 @@ void MAGIA_reducesum_fp16_spatz(
         return;
     }
 
-    ret = offload_spatz_task(params);
+    ret = mg_spatz_call(REDUCESUM_FP16_SPATZ_TASK, (const void *)params);
     if (ret != 0) {
-        printf("[CV32 (%d)] [%s] Spatz task offloading failed with error: %d\n",
-               HID,
-               KERNEL_NAME,
-               ret);
+        printf("[CV32 (%d)] [%s] Spatz task failed with exit code: %d\n", HID, KERNEL_NAME, ret);
         return;
     }
 
-    ret = store_result(params, Y);
+    ret = store_result((void *)params, Y);
     if (ret != 0) {
         printf("[CV32 (%d)] [%s] Result write back failed with error: %d\n", HID, KERNEL_NAME, ret);
     }
+}
+
+void MAGIA_reducesum_fp16_spatz_l1_start(reducesum_fp16_spatz_params_t *p,
+                                         const float16 *X,
+                                         float16 *Y,
+                                         uint32_t outer_len,
+                                         uint32_t reduce_dim,
+                                         uint32_t inner_dim,
+                                         mg_event_t *event)
+{
+    reducesum_fp16_spatz_params_set(p, X, Y, outer_len, reduce_dim, inner_dim);
+    mg_spatz_run(WFE, REDUCESUM_FP16_SPATZ_TASK, p, event, 0);
+}
+
+void MAGIA_reducesum_fp16_spatz_l1(
+    const float16 *X, float16 *Y, uint32_t outer_len, uint32_t reduce_dim, uint32_t inner_dim)
+{
+    reducesum_fp16_spatz_params_t params;
+    mg_event_t event;
+
+    MAGIA_reducesum_fp16_spatz_l1_start(&params, X, Y, outer_len, reduce_dim, inner_dim, &event);
+    mg_spatz_wait(WFE, &event);
+    if (mg_spatz_exit_code() != 0)
+        printf("[CV32 (%d)] [%s] Spatz task failed with exit code: %d\n",
+               HID,
+               KERNEL_NAME,
+               mg_spatz_exit_code());
 }

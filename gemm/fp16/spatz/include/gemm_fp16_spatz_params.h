@@ -26,6 +26,9 @@ typedef struct {
     uint32_t M; /* Rows of A and C (full)                                   */
     uint32_t N; /* Columns of B and C (full)                                */
     uint32_t K; /* Columns of A - Rows of B                                 */
+
+    _Float16 alpha_l1; /* Storage for alpha (L1 API)                           */
+    _Float16 beta_l1;  /* Storage for beta (L1 API)                            */
 } gemm_fp16_spatz_params_t;
 
 #endif /* GEMM_FP16_SPATZ_PARAMS_H_ */

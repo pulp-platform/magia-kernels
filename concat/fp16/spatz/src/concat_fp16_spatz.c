@@ -5,14 +5,14 @@
 #include <stdint.h>
 #include <errno.h>
 
-#include "eventunit.h"
-#include "idma.h"
 #include "tile.h"
+#include "mg_idma.h"
+#include "mg_spatz.h"
+#include "mg_tile.h"
 
 #include "kernels_profiling_utils.h"
 
 #include "concat_fp16_spatz.h"
-#include "concat_fp16_spatz_params.h"
 #include "concat_fp16_spatz_task_bin.h"
 
 #define HID         get_hartid()
@@ -26,19 +26,11 @@ static int alloc_l1(void **params, const uint32_t *lens, uint32_t num_inputs, ui
     uintptr_t shard;
     uintptr_t shard_output;
 
-    size_t iter_start;
-    size_t iter_end;
-    size_t iter_len;
-    size_t elems;
-    size_t left;
+    uint32_t iter_start;
+    uint32_t iter_len;
     size_t out_len;
 
-    elems = iterations / NUM_HARTS;
-    left  = iterations % NUM_HARTS;
-
-    iter_start = HID * elems + (HID < left ? HID : left);
-    iter_end   = iter_start + elems + (HID < left ? 1 : 0);
-    iter_len   = iter_end - iter_start;
+    mg_split(iterations, NUM_HARTS, HID, &iter_start, &iter_len);
 
     l1_alloc_init();
 
@@ -108,77 +100,15 @@ static int init_input_params(void *params, const float16 **inputs)
     for (uint32_t i = 0; i < num_inputs; i++) {
         len_in = len_input[i];
         if (len_in) {
-            idma_memcpy_1d(0,
-                           (uint32_t)(inputs[i] + iter_start * len_in),
-                           (uint32_t)shard_input[i],
-                           iter_len * len_in * sizeof(float16));
-            eu_idma_wait_a2o(WFE);
+            mg_idma_memcpy_1d_sync(WFE,
+                                   0,
+                                   (uint32_t)(inputs[i] + iter_start * len_in),
+                                   (uint32_t)shard_input[i],
+                                   iter_len * len_in * sizeof(float16));
         }
     }
 
     return 0;
-}
-
-static int offload_spatz_task(void *params)
-{
-    int ret;
-
-    spatz_run_task_with_params(CONCAT_FP16_SPATZ_TASK, params);
-
-    ret = eu_spatz_wait(WFE);
-    if (ret == 0) {
-        printf("[CV32 (%d)] [%s] Wait on Spatz task completion failed with error: %d\n",
-               HID,
-               KERNEL_NAME,
-               ret);
-        goto exit;
-    }
-
-    ret = spatz_get_exit_code();
-
-exit:
-    return ret;
-}
-
-/*
- * Concat on this tile's Spatz, for operands already in this tile's L1: no sharding across tiles,
- * no L1 allocation and no L2 transfers.
- */
-void MAGIA_concat_fp16_spatz_l1(const float16 **inputs,
-                                const uint32_t *lens,
-                                uint32_t num_inputs,
-                                float16 *concat_result,
-                                uint32_t iterations)
-{
-    volatile uintptr_t shard_input[num_inputs];
-    volatile uint32_t len_input[num_inputs];
-    int ret;
-
-    /*
-     * The task reads the input addresses and lengths through the params: stage them on this
-     * core's stack, which is in L1.
-     */
-    for (uint32_t i = 0; i < num_inputs; i++) {
-        shard_input[i] = (uintptr_t)inputs[i];
-        len_input[i]   = lens[i];
-    }
-
-    volatile concat_fp16_spatz_params_t params = {
-        .shard_input  = (uintptr_t)shard_input,
-        .len_input    = (uintptr_t)len_input,
-        .shard_output = (uintptr_t)concat_result,
-        .iter_start   = 0,
-        .iter_len     = iterations,
-        .num_inputs   = num_inputs,
-    };
-
-    ret = offload_spatz_task((void *)&params);
-    if (ret != 0) {
-        printf("[CV32 (%d)] [%s] Spatz task offloading failed with error: %d\n",
-               HID,
-               KERNEL_NAME,
-               ret);
-    }
 }
 
 static int store_result(void *params, float16 *concat_result, const uint32_t iterations)
@@ -206,11 +136,11 @@ static int store_result(void *params, float16 *concat_result, const uint32_t ite
         out_len += len_input[i];
 
     /* This tile's output rows [iter_start, iter_start+iter_len) are contiguous in L2. */
-    idma_memcpy_1d(1,
-                   (uint32_t)(concat_result + start * out_len),
-                   (uint32_t)shard_output_base,
-                   len * out_len * sizeof(float16));
-    eu_idma_wait_o2a(WFE);
+    mg_idma_memcpy_1d_sync(WFE,
+                           1,
+                           (uint32_t)(concat_result + start * out_len),
+                           (uint32_t)shard_output_base,
+                           len * out_len * sizeof(float16));
 
     return 0;
 }
@@ -224,13 +154,13 @@ void MAGIA_concat_fp16_spatz(const float16 **inputs,
     int ret;
     volatile concat_fp16_spatz_params_t *params;
 
-    PROF_PHASE(prof_cyc_alloc, ret, alloc_l1(&params, lens, num_inputs, iterations));
+    PROF_PHASE(prof_cyc_alloc, ret, alloc_l1((void **)&params, lens, num_inputs, iterations));
     if (ret != 0) {
         printf("[CV32 (%d)] [%s] L1 allocation failed with error: %d\n", HID, KERNEL_NAME, ret);
         return;
     }
 
-    PROF_PHASE(prof_cyc_data_in, ret, init_input_params(params, inputs));
+    PROF_PHASE(prof_cyc_data_in, ret, init_input_params((void *)params, inputs));
     if (ret != 0) {
         printf("[CV32 (%d)] [%s] Params initialization failed with error: %d\n",
                HID,
@@ -239,17 +169,56 @@ void MAGIA_concat_fp16_spatz(const float16 **inputs,
         return;
     }
 
-    PROF_PHASE(prof_cyc_compute, ret, offload_spatz_task(params));
+    PROF_PHASE(prof_cyc_compute, ret, mg_spatz_call(CONCAT_FP16_SPATZ_TASK, (const void *)params));
     if (ret != 0) {
-        printf("[CV32 (%d)] [%s] Spatz task offloading failed with error: %d\n",
-               HID,
-               KERNEL_NAME,
-               ret);
+        printf("[CV32 (%d)] [%s] Spatz task failed with exit code: %d\n", HID, KERNEL_NAME, ret);
         return;
     }
 
-    PROF_PHASE(prof_cyc_data_out, ret, store_result(params, concat_result, iterations));
+    PROF_PHASE(prof_cyc_data_out, ret, store_result((void *)params, concat_result, iterations));
     if (ret != 0) {
         printf("[CV32 (%d)] [%s] Result write back failed with error: %d\n", HID, KERNEL_NAME, ret);
     }
+}
+
+void MAGIA_concat_fp16_spatz_l1_start(concat_fp16_spatz_params_t *p,
+                                      const float16 **inputs,
+                                      const uint32_t *lens,
+                                      uint32_t num_inputs,
+                                      float16 *concat_result,
+                                      uint32_t iterations,
+                                      mg_event_t *event)
+{
+    concat_fp16_spatz_params_set(p, inputs, lens, num_inputs, concat_result, iterations);
+    mg_spatz_run(WFE, CONCAT_FP16_SPATZ_TASK, p, event, 0);
+}
+
+void MAGIA_concat_fp16_spatz_l1(const float16 **inputs,
+                                const uint32_t *lens,
+                                uint32_t num_inputs,
+                                float16 *concat_result,
+                                uint32_t iterations)
+{
+    const float16 *shard_input[num_inputs];
+    uint32_t len_input[num_inputs];
+    concat_fp16_spatz_params_t params;
+    mg_event_t event;
+
+    /*
+     * The task reads the input addresses and lengths through the params: stage them on this
+     * core's stack, which is in L1.
+     */
+    for (uint32_t i = 0; i < num_inputs; i++) {
+        shard_input[i] = inputs[i];
+        len_input[i]   = lens[i];
+    }
+
+    MAGIA_concat_fp16_spatz_l1_start(
+        &params, shard_input, len_input, num_inputs, concat_result, iterations, &event);
+    mg_spatz_wait(WFE, &event);
+    if (mg_spatz_exit_code() != 0)
+        printf("[CV32 (%d)] [%s] Spatz task failed with exit code: %d\n",
+               HID,
+               KERNEL_NAME,
+               mg_spatz_exit_code());
 }

@@ -9,7 +9,8 @@
 #include <stdint.h>
 
 #include "tile.h"
-#include "fsync.h"
+#include "mg_fsync.h"
+#include "mg_spatz.h"
 #include "mg_idma.h"
 #include "mg_redmule.h"
 #include "mg_event.h"
@@ -19,40 +20,40 @@
 #define S_BLOCK_SIZE_Q  512
 #define S_BLOCK_SIZE_KV 512
 
-/** L1 kernel (CORE): all pointers are L1 addresses. */
+/** L1 kernel (SPATZ): all pointers are L1 addresses. */
 extern void l1_rowmax_fp16_spatz(uint32_t m, uint32_t x, uint32_t p0, uint32_t p1);
 
-/** L1 kernel (CORE): all pointers are L1 addresses. */
+/** L1 kernel (SPATZ): all pointers are L1 addresses. */
 extern void l1_rowmax_max_fp16_spatz(uint32_t m, uint32_t x, uint32_t p, uint32_t p0, uint32_t p1);
 
-/** L1 kernel (CORE): all pointers are L1 addresses. */
+/** L1 kernel (SPATZ): all pointers are L1 addresses. */
 extern void l1_expminus_rowsum_start_fp16_spatz(
     uint32_t y, uint32_t s, uint32_t x, uint32_t m, uint32_t p0, uint32_t p1);
 
-/** L1 kernel (CORE): all pointers are L1 addresses. */
+/** L1 kernel (SPATZ): all pointers are L1 addresses. */
 extern void l1_expminus_rowsum_alpha_start_fp16_spatz(
     uint32_t y, uint32_t s, uint32_t a, uint32_t x, uint32_t m, uint32_t p0, uint32_t p1);
 
-/** L1 kernel (CORE): all pointers are L1 addresses. */
+/** L1 kernel (SPATZ): all pointers are L1 addresses. */
 extern void l1_spatz_wait(uint32_t y, uint32_t s);
 
-/** L1 kernel (CORE): all pointers are L1 addresses. */
+/** L1 kernel (SPATZ): all pointers are L1 addresses. */
 extern void l1_colsum_acc_fp16_spatz(uint32_t s, uint32_t g, uint32_t p0, uint32_t p1);
 
-/** L1 kernel (CORE): all pointers are L1 addresses. */
+/** L1 kernel (SPATZ): all pointers are L1 addresses. */
 extern void l1_colsum_acc_rescale_fp16_spatz(
     uint32_t s, uint32_t g, uint32_t p, uint32_t a, uint32_t p0, uint32_t p1);
 
-/** L1 kernel (CORE): all pointers are L1 addresses. */
+/** L1 kernel (SPATZ): all pointers are L1 addresses. */
 extern void l1_colmax_fp16_spatz(uint32_t m, uint32_t x, uint32_t p0, uint32_t p1);
 
-/** L1 kernel (CORE): all pointers are L1 addresses. */
+/** L1 kernel (SPATZ): all pointers are L1 addresses. */
 extern void l1_add_fp16_spatz(uint32_t y, uint32_t a, uint32_t b, uint32_t p0);
 
-/** L1 kernel (CORE): all pointers are L1 addresses. */
+/** L1 kernel (SPATZ): all pointers are L1 addresses. */
 extern void l1_rowscale_fp16_spatz(uint32_t y, uint32_t x, uint32_t s, uint32_t p0, uint32_t p1);
 
-/** L1 kernel (CORE): all pointers are L1 addresses. */
+/** L1 kernel (SPATZ): all pointers are L1 addresses. */
 extern void l1_rowdiv_fp16_spatz(uint32_t y, uint32_t x, uint32_t s, uint32_t p0, uint32_t p1);
 
 /**
@@ -83,18 +84,18 @@ void mgc_flat_attn_pipeopt3(uint16_t *q_inp,
 
     /**
      * 0. Get the mesh-tile's hartid, mesh-tile coordinates and define its L1 base,
-     * also initialize the controllers for the idma, redmule and fsync
+     * also initialize the controllers for the idma, redmule, fsync and Spatz
      */
     uint32_t hartid = get_hartid();
 
-    fsync_init();
     idma_init();
     redmule_init();
 
     eu_init();
     eu_redmule_init(0);
     eu_idma_init(0);
-    eu_fsync_init(0);
+    mg_fsync_init();
+    mg_spatz_init();
 
     uint32_t ii           = GET_Y_ID(hartid);
     uint32_t jj           = GET_X_ID(hartid);
@@ -302,13 +303,11 @@ void mgc_flat_attn_pipeopt3(uint16_t *q_inp,
             if ((dv % (2 * stride_mc)) == 0) {
                 mg_idma_wait(1, WAIT_MODE, &idma_evt_v_out);
             }
-            fsync_sync_global();
-            eu_fsync_wait(WAIT_MODE);
+            mg_fsync_global(WAIT_MODE);
             stride_mc = stride_mc / 2;
         }
     }
-    fsync_sync_global();
-    eu_fsync_wait(WAIT_MODE);
+    mg_fsync_global(WAIT_MODE);
 
     /**
      * STAGE 1: MATMUL Q @ Kt
@@ -461,8 +460,7 @@ void mgc_flat_attn_pipeopt3(uint16_t *q_inp,
                                   NULL);
                 mg_idma_wait(1, WAIT_MODE, &idma_evt_row_gather_buf);
             }
-            fsync_sync_row();
-            eu_fsync_wait(WAIT_MODE);
+            mg_fsync_row(WAIT_MODE);
 
             // row max over the whole S dimension: row_max [Stile] = max over the rows of
             // row_gather_buf [MESH_X_TILES x Stile] on the first-column tile, then multicast to the
@@ -480,8 +478,7 @@ void mgc_flat_attn_pipeopt3(uint16_t *q_inp,
                                   NULL);
                 mg_idma_wait(1, WAIT_MODE, &idma_evt_row_max);
             }
-            fsync_sync_row();
-            eu_fsync_wait(WAIT_MODE);
+            mg_fsync_row(WAIT_MODE);
 
             // start attn [Stile x Stile] = exp((attn - row_max [Stile]) / sqrt(P)) in place
             // (row_max broadcast along the columns), and its per-tile row sum -> row_sum [Stile].
@@ -612,8 +609,7 @@ void mgc_flat_attn_pipeopt3(uint16_t *q_inp,
                     if ((dv % (2 * stride_mc)) == 0) {
                         mg_idma_wait(1, WAIT_MODE, &idma_evt_v_out);
                     }
-                    fsync_sync_global();
-                    eu_fsync_wait(WAIT_MODE);
+                    mg_fsync_global(WAIT_MODE);
                     stride_mc = stride_mc / 2;
                 }
             }
@@ -634,8 +630,7 @@ void mgc_flat_attn_pipeopt3(uint16_t *q_inp,
                                   NULL);
                 mg_idma_wait(1, WAIT_MODE, &idma_evt_row_sum);
             }
-            fsync_sync_row();
-            eu_fsync_wait(WAIT_MODE);
+            mg_fsync_row(WAIT_MODE);
 
             // row sum over the whole S dimension: row_sum [Stile] += sum over the rows jj > 0 of
             // row_gather_buf [MESH_X_TILES x Stile]; from the second K/V block on, also add the
@@ -663,8 +658,7 @@ void mgc_flat_attn_pipeopt3(uint16_t *q_inp,
                                   NULL);
                 mg_idma_wait(1, WAIT_MODE, &idma_evt_row_sum);
             }
-            fsync_sync_row();
-            eu_fsync_wait(WAIT_MODE);
+            mg_fsync_row(WAIT_MODE);
         }
 
         if (it > 1) {
@@ -692,15 +686,13 @@ void mgc_flat_attn_pipeopt3(uint16_t *q_inp,
                                               NULL);
                             mg_idma_wait(1, WAIT_MODE, &idma_evt_o);
                         }
-                        fsync_sync_row();
-                        eu_fsync_wait(WAIT_MODE);
+                        mg_fsync_row(WAIT_MODE);
 
                         if ((jj % (2 * stride)) == 0 && (jj + stride) < MESH_X_TILES) {
                             l1_add_fp16_spatz(
                                 l1_addr_o, l1_addr_o, l1_addr_o_tree_recv_buf, tiles_i * PROJ_SIZE);
                         }
-                        fsync_sync_row();
-                        eu_fsync_wait(WAIT_MODE);
+                        mg_fsync_row(WAIT_MODE);
                         stride = stride * 2;
                     }
                 }
@@ -721,7 +713,6 @@ void mgc_flat_attn_pipeopt3(uint16_t *q_inp,
         if (it < s_block_nb) {
             mg_redmule_wait(WAIT_MODE, &redmule_evt_attn);
         }
-        fsync_sync_global();
-        eu_fsync_wait(WAIT_MODE);
+        mg_fsync_global(WAIT_MODE);
     }
 }

@@ -9,7 +9,8 @@
 #include <stdint.h>
 
 #include "tile.h"
-#include "fsync.h"
+#include "mg_fsync.h"
+#include "mg_spatz.h"
 #include "mg_idma.h"
 #include "mg_redmule.h"
 #include "mg_event.h"
@@ -17,10 +18,10 @@
 
 #define WAIT_MODE WFE
 
-/** L1 kernel (CORE): all pointers are L1 addresses. */
+/** L1 kernel (SPATZ): all pointers are L1 addresses. */
 extern void l1_im2col_start_fp16_spatz(uint32_t col, uint32_t x, uint32_t row, uint32_t x0);
 
-/** L1 kernel (CORE): all pointers are L1 addresses. */
+/** L1 kernel (SPATZ): all pointers are L1 addresses. */
 extern void l1_im2col_wait(uint32_t col);
 
 /**
@@ -80,18 +81,18 @@ void mgc_conv_im2col_opt(uint16_t *x_inp,
 
     /**
      * 0. Get the mesh-tile's hartid, mesh-tile coordinates and define its L1 base,
-     * also initialize the controllers for the idma, redmule and fsync
+     * also initialize the controllers for the idma, redmule, fsync and Spatz
      */
     uint32_t hartid = get_hartid();
 
-    fsync_init();
     idma_init();
     redmule_init();
 
     eu_init();
     eu_redmule_init(0);
     eu_idma_init(0);
-    eu_fsync_init(0);
+    mg_fsync_init();
+    mg_spatz_init();
 
     uint32_t ii           = GET_Y_ID(hartid);
     uint32_t jj           = GET_X_ID(hartid);
@@ -167,8 +168,7 @@ void mgc_conv_im2col_opt(uint16_t *x_inp,
 
         // the caller's y_out may be in the shared .bss, which tile 0 clears in its crt0 while the
         // other tiles may already run: no output store before every tile is in main
-        fsync_sync_global();
-        eu_fsync_wait(WAIT_MODE);
+        mg_fsync_global(WAIT_MODE);
 
         for (int wb = 0; wb < CONV_WNB; wb++) {
             // first output column of the W block, and first column of its input window (clamped as
@@ -208,8 +208,7 @@ void mgc_conv_im2col_opt(uint16_t *x_inp,
                               &idma_evt_xin,
                               NULL);
             mg_idma_wait(0, WAIT_MODE, &idma_evt_xin);
-            fsync_sync_row();
-            eu_fsync_wait(WAIT_MODE);
+            mg_fsync_row(WAIT_MODE);
 
             /**
              * pipeline: 4 stages; step i runs stage k on iteration i + 1 - k
@@ -310,8 +309,7 @@ void mgc_conv_im2col_opt(uint16_t *x_inp,
                 if (i > 1) {
                     mg_idma_wait(1, WAIT_MODE, &idma_evt_y);
                 }
-                fsync_sync_row();
-                eu_fsync_wait(WAIT_MODE);
+                mg_fsync_row(WAIT_MODE);
             }
         }
     }

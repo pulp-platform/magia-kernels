@@ -6,6 +6,8 @@
 #define BIAS_ROPE_T_FP16_SPATZ_H_
 
 #include <stdint.h>
+#include "mg_event.h"
+#include "bias_rope_t_fp16_spatz_params.h"
 
 /*
  * X[r, t] += B[r], then the RoPE of each column (token) with the channels of each head in groups
@@ -33,5 +35,43 @@ void MAGIA_bias_rope_t_fp16_spatz_l1(float16 *X,
                                      uint32_t row0,
                                      uint32_t head_dim,
                                      uint32_t group);
+
+/*
+ * As MAGIA_bias_rope_t_fp16_spatz_l1, but only starts the Spatz task, with the parameter block `p`
+ * (which must stay valid until it completes): mg_spatz_wait(mode, event) waits for it.
+ */
+void MAGIA_bias_rope_t_fp16_spatz_l1_start(bias_rope_t_fp16_spatz_params_t *p,
+                                           float16 *X,
+                                           const float16 *B,
+                                           const float16 *C,
+                                           const float16 *S,
+                                           uint32_t rows,
+                                           uint32_t cols,
+                                           uint32_t row0,
+                                           uint32_t head_dim,
+                                           uint32_t group,
+                                           mg_event_t *event);
+
+/* Fill the parameter block `p` for MAGIA_bias_rope_t_fp16_spatz_l1_start. */
+static inline void bias_rope_t_fp16_spatz_params_set(bias_rope_t_fp16_spatz_params_t *p,
+                                                     float16 *X,
+                                                     const float16 *B,
+                                                     const float16 *C,
+                                                     const float16 *S,
+                                                     uint32_t rows,
+                                                     uint32_t cols,
+                                                     uint32_t row0,
+                                                     uint32_t head_dim,
+                                                     uint32_t group)
+{
+    p->shard_X  = (uintptr_t)X;
+    p->bias     = (uintptr_t)B;
+    p->cos      = (uintptr_t)C;
+    p->sin      = (uintptr_t)S;
+    p->dims     = rows | (cols << 16);
+    p->row0     = row0;
+    p->head_dim = head_dim;
+    p->group    = group;
+}
 
 #endif /* BIAS_ROPE_T_FP16_SPATZ_H_ */

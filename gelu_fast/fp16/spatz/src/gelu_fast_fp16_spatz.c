@@ -5,26 +5,16 @@
 #include <stdint.h>
 #include <errno.h>
 
-#include "eventunit.h"
-#include "idma.h"
 #include "tile.h"
+#include "mg_idma.h"
+#include "mg_spatz.h"
+#include "mg_tile.h"
 
 #include "gelu_fast_fp16_spatz.h"
-#include "gelu_fast_fp16_spatz_params.h"
 #include "gelu_fast_fp16_spatz_task_bin.h"
 
 #define HID         get_hartid()
 #define KERNEL_NAME "gelu_fast_fp16_spatz"
-
-/* This tile's elements [*elem_start, *elem_start + *elem_len) out of len. */
-static void tile_elems(uint32_t len, uint32_t *elem_start, uint32_t *elem_len)
-{
-    uint32_t elems = len / NUM_HARTS;
-    uint32_t left  = len % NUM_HARTS;
-
-    *elem_start = HID * elems + (HID < left ? HID : left);
-    *elem_len   = elems + (HID < left ? 1 : 0);
-}
 
 static int alloc_l1(void **params, uint32_t len)
 {
@@ -33,7 +23,7 @@ static int alloc_l1(void **params, uint32_t len)
     uint32_t elem_start;
     uint32_t elem_len;
 
-    tile_elems(len, &elem_start, &elem_len);
+    mg_split(len, NUM_HARTS, HID, &elem_start, &elem_len);
 
     l1_alloc_init();
 
@@ -62,56 +52,18 @@ static int init_input_params(void *params, const float16 *X, uint32_t len)
     uint32_t elem_len;
 
     gf_params = (volatile gelu_fast_fp16_spatz_params_t *)params;
-    tile_elems(len, &elem_start, &elem_len);
+    mg_split(len, NUM_HARTS, HID, &elem_start, &elem_len);
 
     if (elem_len == 0)
         return 0;
 
-    idma_memcpy_1d(
-        0, (uint32_t)(X + elem_start), (uint32_t)gf_params->shard_X, elem_len * sizeof(float16));
-    eu_idma_wait_a2o(WFE);
+    mg_idma_memcpy_1d_sync(WFE,
+                           0,
+                           (uint32_t)(X + elem_start),
+                           (uint32_t)gf_params->shard_X,
+                           elem_len * sizeof(float16));
 
     return 0;
-}
-
-static int offload_spatz_task(void *params)
-{
-    int ret;
-
-    spatz_run_task_with_params(GELU_FAST_FP16_SPATZ_TASK, (uint32_t)params);
-
-    ret = eu_spatz_wait(WFE);
-    if (ret == 0) {
-        printf("[CV32 (%d)] [%s] Wait on Spatz task completion failed with error: %d\n",
-               HID,
-               KERNEL_NAME,
-               ret);
-        goto exit;
-    }
-
-    ret = spatz_get_exit_code();
-
-exit:
-    return ret;
-}
-
-void MAGIA_gelu_fast_fp16_spatz_l1(float16 *Y, const float16 *X, uint32_t len)
-{
-    volatile gelu_fast_fp16_spatz_params_t params;
-    int ret;
-
-    /* Field by field: GCC hits an internal error on this 3-word volatile initializer. */
-    params.shard_X = (uintptr_t)X;
-    params.shard_Y = (uintptr_t)Y;
-    params.len     = len;
-
-    ret = offload_spatz_task((void *)&params);
-    if (ret != 0) {
-        printf("[CV32 (%d)] [%s] Spatz task offloading failed with error: %d\n",
-               HID,
-               KERNEL_NAME,
-               ret);
-    }
 }
 
 static int store_result(void *params, float16 *Y, uint32_t len)
@@ -121,14 +73,16 @@ static int store_result(void *params, float16 *Y, uint32_t len)
     uint32_t elem_len;
 
     gf_params = (volatile gelu_fast_fp16_spatz_params_t *)params;
-    tile_elems(len, &elem_start, &elem_len);
+    mg_split(len, NUM_HARTS, HID, &elem_start, &elem_len);
 
     if (elem_len == 0)
         return 0;
 
-    idma_memcpy_1d(
-        1, (uint32_t)(Y + elem_start), (uint32_t)gf_params->shard_Y, elem_len * sizeof(float16));
-    eu_idma_wait_o2a(WFE);
+    mg_idma_memcpy_1d_sync(WFE,
+                           1,
+                           (uint32_t)(Y + elem_start),
+                           (uint32_t)gf_params->shard_Y,
+                           elem_len * sizeof(float16));
 
     return 0;
 }
@@ -153,12 +107,9 @@ void MAGIA_gelu_fast_fp16_spatz(float16 *Y, const float16 *X, uint32_t len)
         return;
     }
 
-    ret = offload_spatz_task((void *)params);
+    ret = mg_spatz_call(GELU_FAST_FP16_SPATZ_TASK, (const void *)params);
     if (ret != 0) {
-        printf("[CV32 (%d)] [%s] Spatz task offloading failed with error: %d\n",
-               HID,
-               KERNEL_NAME,
-               ret);
+        printf("[CV32 (%d)] [%s] Spatz task failed with exit code: %d\n", HID, KERNEL_NAME, ret);
         return;
     }
 
@@ -166,4 +117,28 @@ void MAGIA_gelu_fast_fp16_spatz(float16 *Y, const float16 *X, uint32_t len)
     if (ret != 0) {
         printf("[CV32 (%d)] [%s] Result write back failed with error: %d\n", HID, KERNEL_NAME, ret);
     }
+}
+
+void MAGIA_gelu_fast_fp16_spatz_l1_start(gelu_fast_fp16_spatz_params_t *p,
+                                         float16 *Y,
+                                         const float16 *X,
+                                         uint32_t len,
+                                         mg_event_t *event)
+{
+    gelu_fast_fp16_spatz_params_set(p, Y, X, len);
+    mg_spatz_run(WFE, GELU_FAST_FP16_SPATZ_TASK, p, event, 0);
+}
+
+void MAGIA_gelu_fast_fp16_spatz_l1(float16 *Y, const float16 *X, uint32_t len)
+{
+    gelu_fast_fp16_spatz_params_t params;
+    mg_event_t event;
+
+    MAGIA_gelu_fast_fp16_spatz_l1_start(&params, Y, X, len, &event);
+    mg_spatz_wait(WFE, &event);
+    if (mg_spatz_exit_code() != 0)
+        printf("[CV32 (%d)] [%s] Spatz task failed with exit code: %d\n",
+               HID,
+               KERNEL_NAME,
+               mg_spatz_exit_code());
 }

@@ -14,6 +14,8 @@
 #define MGC_GLUE
 #include "mgc_gqa_pipeopt3.h"
 #include "tile.h"
+#include "mg_spatz.h"
+#include "mg_tile.h"
 #include "add_fp16_spatz.h"
 #include "rowdiv_fp16_spatz.h"
 #include "colmax_fp16_spatz_params.h"
@@ -22,10 +24,8 @@
 #include "rowmax_fp16_spatz_params.h"
 #include "rowscale_fp16_spatz_params.h"
 #include "eventunit.h"
+#define SPATZ_BINARY_NO_DEFINE
 #include "gqa_pipeopt3_spatz_task_bin.h"
-
-/* Per-tile flag: set once Spatz has been set up on this tile (before its first task). */
-static volatile uint8_t spatz_ready __attribute__((section(".tile_bss")));
 
 /*
  * Per-tile Spatz task parameter blocks, preallocated in L1 so that each call only stores the
@@ -39,29 +39,6 @@ static struct {
     expminus_rowsum_fp16_spatz_params_t expminus_rowsum;
     colsum_rescale_fp16_spatz_params_t colsum_rescale;
 } spatz_params __attribute__((section(".tile_bss")));
-
-/**
- * Lazy Spatz setup on this tile (event unit line, binary and clock): the mgc-generated main
- * does not know about Spatz.
- */
-static void spatz_setup(void)
-{
-    if (spatz_ready)
-        return;
-    eu_spatz_init(0);
-    spatz_init(SPATZ_BINARY_START);
-    spatz_ready = 1;
-}
-
-/* Runs `task` on this tile's Spatz with the parameter block `params`, and waits for it. */
-static inline void spatz_offload(uint32_t task, void *params)
-{
-    spatz_setup();
-    /* Compiler barrier: the parameter-block stores must be issued before Spatz is triggered. */
-    asm volatile("" ::: "memory");
-    spatz_run_task_with_params(task, (uint32_t)params);
-    eu_wait_events(EU_SPATZ_DONE_MASK, WFE, 0);
-}
 
 /**
  * y[r, c] = x[r, c] * s[r] for a `rows` x `cols` fp16 matrix, i.e. y = diag(s) x, on this
@@ -78,7 +55,8 @@ void l1_rowscale_fp16_spatz(uint32_t y, uint32_t x, uint32_t s, uint32_t rows, u
         p->row_len = rows;
     }
     p->shard_S = s;
-    spatz_offload(ROWSCALE_FP16_SPATZ_TASK, p);
+    mg_spatz_start(ROWSCALE_FP16_SPATZ_TASK, p);
+    mg_spatz_wait_last(WFE);
 }
 
 /**
@@ -94,7 +72,8 @@ void l1_rowmax_fp16_spatz(uint32_t m, uint32_t x, uint32_t rows, uint32_t cols)
     }
     p->shard_X = x;
     p->shard_P = 0;
-    spatz_offload(ROWMAX_FP16_SPATZ_TASK, p);
+    mg_spatz_start(ROWMAX_FP16_SPATZ_TASK, p);
+    mg_spatz_wait_last(WFE);
 }
 
 /**
@@ -110,7 +89,8 @@ void l1_rowmax_max_fp16_spatz(uint32_t m, uint32_t x, uint32_t pm, uint32_t rows
     }
     p->shard_X = x;
     p->shard_P = pm;
-    spatz_offload(ROWMAX_FP16_SPATZ_TASK, p);
+    mg_spatz_start(ROWMAX_FP16_SPATZ_TASK, p);
+    mg_spatz_wait_last(WFE);
 }
 
 /**
@@ -126,7 +106,8 @@ void l1_colmax_fp16_spatz(uint32_t m, uint32_t x, uint32_t rows, uint32_t cols)
         p->dims    = rows | (cols << 16);
     }
     p->shard_M = m;
-    spatz_offload(COLMAX_FP16_SPATZ_TASK, p);
+    mg_spatz_start(COLMAX_FP16_SPATZ_TASK, p);
+    mg_spatz_wait_last(WFE);
 }
 
 /* Sets the fixed fields of the expminus_rowsum block, with the scale 1/sqrt(PROJ_SIZE). */
@@ -135,15 +116,7 @@ static inline void expminus_rowsum_init(expminus_rowsum_fp16_spatz_params_t *p,
                                         uint32_t cols)
 {
     expminus_rowsum_fp16_spatz_set_scale(
-        p, (float16)((union { uint16_t u; float16 f; }){.u = QK_SCALE_FP16}.f), rows, cols);
-}
-
-/* Starts `task` on this tile's Spatz with the parameter block `params`, without waiting. */
-static inline void spatz_launch(uint32_t task, void *params)
-{
-    spatz_setup();
-    asm volatile("" ::: "memory");
-    spatz_run_task_with_params(task, (uint32_t)params);
+        p, mg_fp16_from_bits(QK_SCALE_FP16), rows, cols);
 }
 
 /**
@@ -152,7 +125,7 @@ static inline void spatz_launch(uint32_t task, void *params)
  */
 void l1_spatz_wait(uint32_t y, uint32_t s)
 {
-    eu_wait_events(EU_SPATZ_DONE_MASK, WFE, 0);
+    mg_spatz_wait_last(WFE);
 }
 
 /**
@@ -171,7 +144,7 @@ void l1_expminus_rowsum_start_fp16_spatz(
     p->shard_Y = y;
     p->shard_S = s;
     p->shard_A = 0;
-    spatz_launch(EXPMINUS_ROWSUM_FP16_SPATZ_TASK, p);
+    mg_spatz_start(EXPMINUS_ROWSUM_FP16_SPATZ_TASK, p);
 }
 
 /**
@@ -190,7 +163,7 @@ void l1_expminus_rowsum_alpha_start_fp16_spatz(
     p->shard_Y = y;
     p->shard_S = s;
     p->shard_A = a;
-    spatz_launch(EXPMINUS_ROWSUM_FP16_SPATZ_TASK, p);
+    mg_spatz_start(EXPMINUS_ROWSUM_FP16_SPATZ_TASK, p);
 }
 
 /**
@@ -207,7 +180,8 @@ void l1_colsum_acc_fp16_spatz(uint32_t s, uint32_t g, uint32_t rows, uint32_t co
     p->shard_S = s;
     p->shard_P = 0;
     p->shard_A = 0;
-    spatz_offload(COLSUM_RESCALE_FP16_SPATZ_TASK, p);
+    mg_spatz_start(COLSUM_RESCALE_FP16_SPATZ_TASK, p);
+    mg_spatz_wait_last(WFE);
 }
 
 /**
@@ -225,7 +199,8 @@ void l1_colsum_acc_rescale_fp16_spatz(
     p->shard_S = s;
     p->shard_P = pp;
     p->shard_A = a;
-    spatz_offload(COLSUM_RESCALE_FP16_SPATZ_TASK, p);
+    mg_spatz_start(COLSUM_RESCALE_FP16_SPATZ_TASK, p);
+    mg_spatz_wait_last(WFE);
 }
 
 /**
@@ -233,7 +208,6 @@ void l1_colsum_acc_rescale_fp16_spatz(
  */
 void l1_add_fp16_spatz(uint32_t y, uint32_t a, uint32_t b, uint32_t n)
 {
-    spatz_setup();
     MAGIA_add_fp16_spatz_l1((const float16 *)a, (const float16 *)b, (float16 *)y, n);
 }
 
@@ -243,6 +217,5 @@ void l1_add_fp16_spatz(uint32_t y, uint32_t a, uint32_t b, uint32_t n)
  */
 void l1_rowdiv_fp16_spatz(uint32_t y, uint32_t x, uint32_t s, uint32_t rows, uint32_t cols)
 {
-    spatz_setup();
     MAGIA_rowdiv_fp16_spatz_l1((const float16 *)x, (const float16 *)s, (float16 *)y, rows, cols);
 }
