@@ -40,6 +40,9 @@ typedef struct {
     uint32_t stride_w; /* Stride Along Width                              */
     uint32_t pad_h;    /* Padding Top/Bottom                              */
     uint32_t pad_w;    /* Padding Left/Right                              */
+
+    _Float16 alpha_l1; /* Storage for alpha (L1 API)                      */
+    _Float16 beta_l1;  /* Storage for beta (L1 API)                       */
 } conv2dgemm_fp16_spatz_params_t;
 
 #endif /* CONV2DGEMM_FP16_SPATZ_PARAMS_H_ */

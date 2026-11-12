@@ -5,40 +5,16 @@
 #include <stdint.h>
 #include <errno.h>
 
-#include "eventunit.h"
-#include "idma.h"
 #include "tile.h"
+#include "mg_idma.h"
+#include "mg_spatz.h"
+#include "mg_tile.h"
 
 #include "softmax_rows_fp16_spatz.h"
-#include "softmax_rows_fp16_spatz_params.h"
 #include "softmax_rows_fp16_spatz_task_bin.h"
 
 #define HID         get_hartid()
 #define KERNEL_NAME "softmax_rows_fp16_spatz"
-
-/* fp16 bits of the exp clamp MIN / s | COEF * s << 16, for the scale s. */
-static uint32_t min_coef(float16 s)
-{
-    union {
-        float16 f[2];
-        uint32_t u;
-    } mc;
-
-    mc.f[0] = (float16)(SOFTMAX_ROWS_EXP_MIN / (float)s);
-    mc.f[1] = (float16)(SOFTMAX_ROWS_EXP_COEF * (float)s);
-
-    return mc.u;
-}
-
-/* This tile's rows [*row_start, *row_start + *row_len) out of rows. */
-static void tile_rows(uint32_t rows, uint32_t *row_start, uint32_t *row_len)
-{
-    uint32_t elems = rows / NUM_HARTS;
-    uint32_t left  = rows % NUM_HARTS;
-
-    *row_start = HID * elems + (HID < left ? HID : left);
-    *row_len   = elems + (HID < left ? 1 : 0);
-}
 
 static int alloc_l1(void **params, float16 s, uint32_t rows, uint32_t cols)
 {
@@ -47,7 +23,7 @@ static int alloc_l1(void **params, float16 s, uint32_t rows, uint32_t cols)
     uint32_t row_start;
     uint32_t row_len;
 
-    tile_rows(rows, &row_start, &row_len);
+    mg_split(rows, NUM_HARTS, HID, &row_start, &row_len);
 
     l1_alloc_init();
 
@@ -61,7 +37,7 @@ static int alloc_l1(void **params, float16 s, uint32_t rows, uint32_t cols)
 
     sm_params->shard_X  = shard_X;
     sm_params->dims     = row_len | (cols << 16);
-    sm_params->min_coef = min_coef(s);
+    sm_params->min_coef = softmax_rows_fp16_spatz_min_coef(s);
 
     *params = (void *)sm_params;
 
@@ -77,59 +53,19 @@ static int init_input_params(void *params, const float16 *X, uint32_t rows)
 
     sm_params = (volatile softmax_rows_fp16_spatz_params_t *)params;
     cols      = sm_params->dims >> 16;
-    tile_rows(rows, &row_start, &row_len);
+    mg_split(rows, NUM_HARTS, HID, &row_start, &row_len);
 
     if (row_len == 0)
         return 0;
 
     /* This tile's rows are contiguous in X. */
-    idma_memcpy_1d(0,
-                   (uint32_t)(X + row_start * cols),
-                   (uint32_t)sm_params->shard_X,
-                   row_len * cols * sizeof(float16));
-    eu_idma_wait_a2o(WFE);
+    mg_idma_memcpy_1d_sync(WFE,
+                           0,
+                           (uint32_t)(X + row_start * cols),
+                           (uint32_t)sm_params->shard_X,
+                           row_len * cols * sizeof(float16));
 
     return 0;
-}
-
-static int offload_spatz_task(void *params)
-{
-    int ret;
-
-    spatz_run_task_with_params(SOFTMAX_ROWS_FP16_SPATZ_TASK, (uint32_t)params);
-
-    ret = eu_spatz_wait(WFE);
-    if (ret == 0) {
-        printf("[CV32 (%d)] [%s] Wait on Spatz task completion failed with error: %d\n",
-               HID,
-               KERNEL_NAME,
-               ret);
-        goto exit;
-    }
-
-    ret = spatz_get_exit_code();
-
-exit:
-    return ret;
-}
-
-void MAGIA_softmax_rows_fp16_spatz_l1(float16 *X, float16 s, uint32_t rows, uint32_t cols)
-{
-    volatile softmax_rows_fp16_spatz_params_t params;
-    int ret;
-
-    /* Field by field: GCC hits an internal error on this 3-word volatile initializer. */
-    params.shard_X  = (uintptr_t)X;
-    params.dims     = rows | (cols << 16);
-    params.min_coef = min_coef(s);
-
-    ret = offload_spatz_task((void *)&params);
-    if (ret != 0) {
-        printf("[CV32 (%d)] [%s] Spatz task offloading failed with error: %d\n",
-               HID,
-               KERNEL_NAME,
-               ret);
-    }
 }
 
 static int store_result(void *params, float16 *X, uint32_t rows)
@@ -141,16 +77,16 @@ static int store_result(void *params, float16 *X, uint32_t rows)
 
     sm_params = (volatile softmax_rows_fp16_spatz_params_t *)params;
     cols      = sm_params->dims >> 16;
-    tile_rows(rows, &row_start, &row_len);
+    mg_split(rows, NUM_HARTS, HID, &row_start, &row_len);
 
     if (row_len == 0)
         return 0;
 
-    idma_memcpy_1d(1,
-                   (uint32_t)(X + row_start * cols),
-                   (uint32_t)sm_params->shard_X,
-                   row_len * cols * sizeof(float16));
-    eu_idma_wait_o2a(WFE);
+    mg_idma_memcpy_1d_sync(WFE,
+                           1,
+                           (uint32_t)(X + row_start * cols),
+                           (uint32_t)sm_params->shard_X,
+                           row_len * cols * sizeof(float16));
 
     return 0;
 }
@@ -175,12 +111,9 @@ void MAGIA_softmax_rows_fp16_spatz(float16 *X, float16 s, uint32_t rows, uint32_
         return;
     }
 
-    ret = offload_spatz_task((void *)params);
+    ret = mg_spatz_call(SOFTMAX_ROWS_FP16_SPATZ_TASK, (const void *)params);
     if (ret != 0) {
-        printf("[CV32 (%d)] [%s] Spatz task offloading failed with error: %d\n",
-               HID,
-               KERNEL_NAME,
-               ret);
+        printf("[CV32 (%d)] [%s] Spatz task failed with exit code: %d\n", HID, KERNEL_NAME, ret);
         return;
     }
 
@@ -188,4 +121,29 @@ void MAGIA_softmax_rows_fp16_spatz(float16 *X, float16 s, uint32_t rows, uint32_
     if (ret != 0) {
         printf("[CV32 (%d)] [%s] Result write back failed with error: %d\n", HID, KERNEL_NAME, ret);
     }
+}
+
+void MAGIA_softmax_rows_fp16_spatz_l1_start(softmax_rows_fp16_spatz_params_t *p,
+                                            float16 *X,
+                                            float16 s,
+                                            uint32_t rows,
+                                            uint32_t cols,
+                                            mg_event_t *event)
+{
+    softmax_rows_fp16_spatz_params_set(p, X, s, rows, cols);
+    mg_spatz_run(WFE, SOFTMAX_ROWS_FP16_SPATZ_TASK, p, event, 0);
+}
+
+void MAGIA_softmax_rows_fp16_spatz_l1(float16 *X, float16 s, uint32_t rows, uint32_t cols)
+{
+    softmax_rows_fp16_spatz_params_t params;
+    mg_event_t event;
+
+    MAGIA_softmax_rows_fp16_spatz_l1_start(&params, X, s, rows, cols, &event);
+    mg_spatz_wait(WFE, &event);
+    if (mg_spatz_exit_code() != 0)
+        printf("[CV32 (%d)] [%s] Spatz task failed with exit code: %d\n",
+               HID,
+               KERNEL_NAME,
+               mg_spatz_exit_code());
 }

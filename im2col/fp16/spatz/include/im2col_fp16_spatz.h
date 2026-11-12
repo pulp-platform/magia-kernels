@@ -7,6 +7,7 @@
 
 #include <stdint.h>
 
+#include "mg_event.h"
 #include "im2col_fp16_spatz_params.h"
 
 /*
@@ -22,5 +23,11 @@ void MAGIA_im2col_fp16_spatz(
  * already in this tile's L1. Waits for the task.
  */
 void MAGIA_im2col_fp16_spatz_l1(const im2col_fp16_spatz_params_t *params);
+
+/*
+ * As MAGIA_im2col_fp16_spatz_l1, but only starts the Spatz task (`params` must stay valid until it
+ * completes): mg_spatz_wait(mode, event) waits for it.
+ */
+void MAGIA_im2col_fp16_spatz_l1_start(const im2col_fp16_spatz_params_t *params, mg_event_t *event);
 
 #endif /* IM2COL_FP16_SPATZ_H_ */

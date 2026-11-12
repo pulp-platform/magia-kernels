@@ -15,6 +15,8 @@ typedef struct {
     uint32_t start;         /* Tile's shard global start index                          */
     uint32_t end;           /* Tile's shard global end index                            */
     uint32_t len;           /* Tile's shard len                                         */
+    _Float16 min_l1;        /* Storage for min (L1 API)                                 */
+    _Float16 max_l1;        /* Storage for max (L1 API)                                 */
 } clip_fp16_spatz_params_t;
 
 #endif /* CLIP_FP16_SPATZ_PARAMS_H_ */

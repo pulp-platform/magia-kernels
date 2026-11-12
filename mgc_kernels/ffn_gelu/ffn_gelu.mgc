@@ -52,8 +52,8 @@ WAIT_MODE = define(WFE)
 # Implemented in src/kernels.c, on the tile's CV32 core:
 # spatz_gelu_start starts x = gelu(x), element-wise and in place, on Spatz (kernels/gelu_fast: tanh form,
 # Schraudolph exp and division in FP16) and returns; spatz_wait(x) waits for it
-spatz_gelu_start = l1_kernel("l1_gelu_start_fp16_spatz", operands=("x:inout",), params=("x.size",), executor=CORE)
-spatz_wait = l1_kernel("l1_spatz_wait1", operands=("x:out",), params=(), executor=CORE)
+spatz_gelu_start = l1_kernel("l1_gelu_start_fp16_spatz", operands=("x:inout",), params=("x.size",), executor=SPATZ)
+spatz_wait = l1_kernel("l1_spatz_wait1", operands=("x:out",), params=(), executor=SPATZ)
 
 @kernel("mgc_ffn_gelu", check=(y_, y_gold), tol=0x11)
 def ffn_gelu():

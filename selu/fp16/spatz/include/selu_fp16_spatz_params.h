@@ -15,6 +15,8 @@ typedef struct {
     uint32_t start;    /* Tile's shard global start index  */
     uint32_t end;      /* Tile's shard global end index    */
     uint32_t len;      /* Tile's shard len                 */
+    _Float16 alpha_l1; /* Storage for alpha (L1 API)       */
+    _Float16 gamma_l1; /* Storage for gamma (L1 API)       */
 } selu_fp16_spatz_params_t;
 
 #endif /* SELU_FP16_PARAMS_H_ */

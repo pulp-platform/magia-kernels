@@ -49,8 +49,8 @@ WAIT_MODE = define(WFE)
 # spatz_swiglu_start starts g = silu(g) * u, element-wise and in place, on Spatz (kernels/swiglu_fast: Schraudolph
 # exp and division in FP16) and returns; spatz_wait(g) waits for it
 spatz_swiglu_start = l1_kernel("l1_swiglu_start_fp16_spatz", operands=("g:inout", "u:in"), params=("g.size",),
-                               executor=CORE)
-spatz_wait = l1_kernel("l1_spatz_wait1", operands=("x:out",), params=(), executor=CORE)
+                               executor=SPATZ)
+spatz_wait = l1_kernel("l1_spatz_wait1", operands=("x:out",), params=(), executor=SPATZ)
 
 @kernel("mgc_ffn_swiglu", check=(y_, y_gold), tol=0x11)
 def ffn_swiglu():

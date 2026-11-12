@@ -5,14 +5,14 @@
 #include <stdint.h>
 #include <errno.h>
 
-#include "eventunit.h"
-#include "idma.h"
 #include "tile.h"
+#include "mg_idma.h"
+#include "mg_spatz.h"
+#include "mg_tile.h"
 
 #include "kernels_profiling_utils.h"
 
 #include "groupnorm_fp16_spatz.h"
-#include "groupnorm_fp16_spatz_params.h"
 #include "groupnorm_fp16_spatz_task_bin.h"
 
 #define HID         get_hartid()
@@ -32,12 +32,8 @@ static int alloc_l1(void **params, uint32_t input_shape[4], uint32_t num_groups,
     size_t c_in;
     size_t h_in;
     size_t w_in;
-    size_t iterations;
-    size_t shard;
-    size_t left;
-    size_t g_start;
-    size_t g_end;
-    size_t g_len;
+    uint32_t g_start;
+    uint32_t g_len;
     size_t c_per_g;
     size_t hw_len;
     size_t elements_per_group;
@@ -49,13 +45,7 @@ static int alloc_l1(void **params, uint32_t input_shape[4], uint32_t num_groups,
     h_in = input_shape[2];
     w_in = input_shape[3];
 
-    iterations = n * num_groups;
-    shard      = iterations / NUM_HARTS;
-    left       = iterations % NUM_HARTS;
-
-    g_start = HID * shard + (HID < left ? HID : left);
-    g_end   = g_start + shard + (HID < left ? 1 : 0);
-    g_len   = g_end - g_start;
+    mg_split(n * num_groups, NUM_HARTS, HID, &g_start, &g_len);
 
     c_per_g            = c_in / num_groups;
     hw_len             = h_in * w_in;
@@ -95,8 +85,8 @@ static int alloc_l1(void **params, uint32_t input_shape[4], uint32_t num_groups,
     groupnorm_params->gamma      = gamma;
     groupnorm_params->beta       = beta;
     groupnorm_params->eps        = eps;
-    groupnorm_params->g_start    = (uint32_t)g_start;
-    groupnorm_params->g_len      = (uint32_t)g_len;
+    groupnorm_params->g_start    = g_start;
+    groupnorm_params->g_len      = g_len;
     groupnorm_params->c_per_g    = (uint32_t)c_per_g;
     groupnorm_params->hw_len     = (uint32_t)hw_len;
     groupnorm_params->num_groups = (uint32_t)num_groups;
@@ -125,76 +115,14 @@ static int init_input_params(
     /* Every tile needs the full input (group means/vars span all its channels), contiguous
        in L2 -> a 1D transfer. Per-channel gamma/beta (full c_out, contiguous) load likewise.
        The Spatz task fully writes shard_Y, so it is not zeroed here. */
-    idma_memcpy_1d(
-        0, (uint32_t)X, (uint32_t)groupnorm_params->shard_X, input_len * sizeof(float16));
-    eu_idma_wait_a2o(WFE);
-    idma_memcpy_1d(0, (uint32_t)scale, (uint32_t)groupnorm_params->gamma, c_out * sizeof(float16));
-    eu_idma_wait_a2o(WFE);
-    idma_memcpy_1d(0, (uint32_t)B, (uint32_t)groupnorm_params->beta, c_out * sizeof(float16));
-    eu_idma_wait_a2o(WFE);
+    mg_idma_memcpy_1d_sync(
+        WFE, 0, (uint32_t)X, (uint32_t)groupnorm_params->shard_X, input_len * sizeof(float16));
+    mg_idma_memcpy_1d_sync(
+        WFE, 0, (uint32_t)scale, (uint32_t)groupnorm_params->gamma, c_out * sizeof(float16));
+    mg_idma_memcpy_1d_sync(
+        WFE, 0, (uint32_t)B, (uint32_t)groupnorm_params->beta, c_out * sizeof(float16));
 
     return 0;
-}
-
-static int offload_spatz_task(void *params)
-{
-    int ret;
-
-    spatz_run_task_with_params(GROUPNORM_FP16_SPATZ_TASK, (uint32_t)params);
-
-    ret = eu_spatz_wait(WFE);
-    if (ret == 0) {
-        printf("[CV32 (%d)] [%s] Wait on Spatz task completion failed with error: %d\n",
-               HID,
-               KERNEL_NAME,
-               ret);
-        goto exit;
-    }
-
-    ret = spatz_get_exit_code();
-
-exit:
-    return ret;
-}
-
-/*
- * GroupNorm of NCHW groups on this tile's Spatz, for operands that are already in this tile's L1:
- * no sharding across tiles, no L1 allocation and no L2 transfers.
- */
-void MAGIA_groupnorm_fp16_spatz_l1(const float16 *X,
-                                   float16 *Y,
-                                   const float16 *scale,
-                                   const float16 *B,
-                                   uint32_t input_shape[4],
-                                   uint32_t num_groups,
-                                   float16 epsilon)
-{
-    uint32_t len         = input_shape[0] * input_shape[1] * input_shape[2] * input_shape[3];
-    volatile float16 eps = epsilon;
-    volatile groupnorm_fp16_spatz_params_t params = {
-        .shard_X    = (uintptr_t)X,
-        .shard_Y    = (uintptr_t)Y,
-        .gamma      = (uintptr_t)scale,
-        .beta       = (uintptr_t)B,
-        .eps        = (uintptr_t)&eps,
-        .g_start    = 0,
-        .g_len      = input_shape[0] * num_groups,
-        .c_per_g    = input_shape[1] / num_groups,
-        .hw_len     = input_shape[2] * input_shape[3],
-        .num_groups = num_groups,
-        .c_out      = input_shape[1],
-        .input_len  = len,
-        .output_len = len,
-    };
-    int ret;
-
-    ret = offload_spatz_task((void *)&params);
-    if (ret != 0) {
-        printf("[CV32 (%d)] [%s] Spatz task offloading failed with error: %d\n",
-               HID,
-               KERNEL_NAME,
-               ret);
-    }
 }
 
 static int store_result(void *params, float16 *Y)
@@ -213,11 +141,11 @@ static int store_result(void *params, float16 *Y)
         return 0;
 
     /* This tile's groups [g_start, g_start+g_len) are contiguous in L2. */
-    idma_memcpy_1d(1,
-                   (uint32_t)(Y + g_start * elements_per_group),
-                   (uint32_t)groupnorm_params->shard_Y,
-                   g_len * elements_per_group * sizeof(float16));
-    eu_idma_wait_o2a(WFE);
+    mg_idma_memcpy_1d_sync(WFE,
+                           1,
+                           (uint32_t)(Y + g_start * elements_per_group),
+                           (uint32_t)groupnorm_params->shard_Y,
+                           g_len * elements_per_group * sizeof(float16));
 
     return 0;
 }
@@ -233,13 +161,13 @@ void MAGIA_groupnorm_fp16_spatz(const float16 *X,
     int ret;
     volatile groupnorm_fp16_spatz_params_t *params;
 
-    PROF_PHASE(prof_cyc_alloc, ret, alloc_l1(&params, input_shape, num_groups, epsilon));
+    PROF_PHASE(prof_cyc_alloc, ret, alloc_l1((void **)&params, input_shape, num_groups, epsilon));
     if (ret != 0) {
         printf("[CV32 (%d)] [%s] L1 allocation failed with error: %d\n", HID, KERNEL_NAME, ret);
         return;
     }
 
-    PROF_PHASE(prof_cyc_data_in, ret, init_input_params(params, X, scale, B, epsilon));
+    PROF_PHASE(prof_cyc_data_in, ret, init_input_params((void *)params, X, scale, B, epsilon));
     if (ret != 0) {
         printf("[CV32 (%d)] [%s] Params initialization failed with error: %d\n",
                HID,
@@ -248,17 +176,50 @@ void MAGIA_groupnorm_fp16_spatz(const float16 *X,
         return;
     }
 
-    PROF_PHASE(prof_cyc_compute, ret, offload_spatz_task(params));
+    PROF_PHASE(
+        prof_cyc_compute, ret, mg_spatz_call(GROUPNORM_FP16_SPATZ_TASK, (const void *)params));
     if (ret != 0) {
-        printf("[CV32 (%d)] [%s] Spatz task offloading failed with error: %d\n",
-               HID,
-               KERNEL_NAME,
-               ret);
+        printf("[CV32 (%d)] [%s] Spatz task failed with exit code: %d\n", HID, KERNEL_NAME, ret);
         return;
     }
 
-    PROF_PHASE(prof_cyc_data_out, ret, store_result(params, Y));
+    PROF_PHASE(prof_cyc_data_out, ret, store_result((void *)params, Y));
     if (ret != 0) {
         printf("[CV32 (%d)] [%s] Result write back failed with error: %d\n", HID, KERNEL_NAME, ret);
     }
+}
+
+void MAGIA_groupnorm_fp16_spatz_l1_start(groupnorm_fp16_spatz_params_t *p,
+                                         const float16 *X,
+                                         float16 *Y,
+                                         const float16 *scale,
+                                         const float16 *B,
+                                         uint32_t input_shape[4],
+                                         uint32_t num_groups,
+                                         float16 epsilon,
+                                         mg_event_t *event)
+{
+    groupnorm_fp16_spatz_params_set(p, X, Y, scale, B, input_shape, num_groups, epsilon);
+    mg_spatz_run(WFE, GROUPNORM_FP16_SPATZ_TASK, p, event, 0);
+}
+
+void MAGIA_groupnorm_fp16_spatz_l1(const float16 *X,
+                                   float16 *Y,
+                                   const float16 *scale,
+                                   const float16 *B,
+                                   uint32_t input_shape[4],
+                                   uint32_t num_groups,
+                                   float16 epsilon)
+{
+    groupnorm_fp16_spatz_params_t params;
+    mg_event_t event;
+
+    MAGIA_groupnorm_fp16_spatz_l1_start(
+        &params, X, Y, scale, B, input_shape, num_groups, epsilon, &event);
+    mg_spatz_wait(WFE, &event);
+    if (mg_spatz_exit_code() != 0)
+        printf("[CV32 (%d)] [%s] Spatz task failed with exit code: %d\n",
+               HID,
+               KERNEL_NAME,
+               mg_spatz_exit_code());
 }

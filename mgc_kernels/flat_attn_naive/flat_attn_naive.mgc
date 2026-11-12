@@ -25,32 +25,32 @@ S_BLOCK_SIZE_KV = define(512)
 
 # Implemented in src/kernels.c and called on the tile's CV32 core; each call returns when its work is done.
 # memset_zero: y[:] = 0 on Spatz (vse16.v of a zeroed register).
-memset_zero = l1_kernel("l1_memset_zero_fp16_spatz", operands=("y:out",), params=("y.size",), executor=CORE)
+memset_zero = l1_kernel("l1_memset_zero_fp16_spatz", operands=("y:out",), params=("y.size",), executor=SPATZ)
 # copy: y[:] = x[:] on the CV32 core (32-bit loads/stores).
-copy = l1_kernel("l1_copy_fp16", operands=("y:out", "x:in"), params=("x.size",), executor=CORE)
+copy = l1_kernel("l1_copy_fp16", operands=("y:out", "x:in"), params=("x.size",), executor=SPATZ)
 # spatz_scale_rsqrt_p: y[:] = x[:] * 1/sqrt(PROJ_SIZE) on Spatz (vfmul.vf, scalar broadcast).
-spatz_scale_rsqrt_p = l1_kernel("l1_scale_rsqrt_p_fp16_spatz", operands=("y:out", "x:in"), params=("x.size",), executor=CORE)
+spatz_scale_rsqrt_p = l1_kernel("l1_scale_rsqrt_p_fp16_spatz", operands=("y:out", "x:in"), params=("x.size",), executor=SPATZ)
 # spatz_rowmax: m[r] = max_c x[r, c] on Spatz (reducemax kernel).
-spatz_rowmax = l1_kernel("l1_rowmax_fp16_spatz", operands=("m:out", "x:in"), params=("x.shape[0]", "x.shape[1]"), executor=CORE)
+spatz_rowmax = l1_kernel("l1_rowmax_fp16_spatz", operands=("m:out", "x:in"), params=("x.shape[0]", "x.shape[1]"), executor=SPATZ)
 # spatz_max: y[k] = max(a[k], b[k]) for k < b.size, on Spatz.
-spatz_max = l1_kernel("l1_max_fp16_spatz", operands=("y:out", "a:in", "b:in"), params=("b.size",), executor=CORE)
+spatz_max = l1_kernel("l1_max_fp16_spatz", operands=("y:out", "a:in", "b:in"), params=("b.size",), executor=SPATZ)
 # spatz_colmax: m[c] = max_r x[r, c] on Spatz.
-spatz_colmax = l1_kernel("l1_colmax_fp16_spatz", operands=("m:out", "x:in"), params=("x.shape[0]", "x.shape[1]"), executor=CORE)
+spatz_colmax = l1_kernel("l1_colmax_fp16_spatz", operands=("m:out", "x:in"), params=("x.shape[0]", "x.shape[1]"), executor=SPATZ)
 # spatz_rowsum: s[r] = sum_c x[r, c] on Spatz (reducesum kernel).
-spatz_rowsum = l1_kernel("l1_rowsum_fp16_spatz", operands=("s:out", "x:in"), params=("x.shape[0]", "x.shape[1]"), executor=CORE)
+spatz_rowsum = l1_kernel("l1_rowsum_fp16_spatz", operands=("s:out", "x:in"), params=("x.shape[0]", "x.shape[1]"), executor=SPATZ)
 # spatz_colsum: s[c] = sum_r x[r, c] on Spatz (reducesum kernel).
-spatz_colsum = l1_kernel("l1_colsum_fp16_spatz", operands=("s:out", "x:in"), params=("x.shape[0]", "x.shape[1]"), executor=CORE)
+spatz_colsum = l1_kernel("l1_colsum_fp16_spatz", operands=("s:out", "x:in"), params=("x.shape[0]", "x.shape[1]"), executor=SPATZ)
 # spatz_expminus: y[r, c] = exp(x[r, c] - m[r]) on Spatz.
-spatz_expminus = l1_kernel("l1_expminus_fp16_spatz", operands=("y:out", "x:in", "m:in"), params=("x.shape[0]", "x.shape[1]"), executor=CORE)
+spatz_expminus = l1_kernel("l1_expminus_fp16_spatz", operands=("y:out", "x:in", "m:in"), params=("x.shape[0]", "x.shape[1]"), executor=SPATZ)
 # spatz_sub, spatz_exp, spatz_mul, spatz_add: element-wise y = a - b, y = exp(x), y = a * b, y = a + b on Spatz.
-spatz_sub = l1_kernel("l1_sub_fp16_spatz", operands=("y:out", "a:in", "b:in"), params=("a.size",), executor=CORE)
-spatz_exp = l1_kernel("l1_exp_fp16_spatz", operands=("y:out", "x:in"), params=("x.size",), executor=CORE)
-spatz_mul = l1_kernel("l1_mul_fp16_spatz", operands=("y:out", "a:in", "b:in"), params=("a.size",), executor=CORE)
-spatz_add = l1_kernel("l1_add_fp16_spatz", operands=("y:out", "a:in", "b:in"), params=("a.size",), executor=CORE)
+spatz_sub = l1_kernel("l1_sub_fp16_spatz", operands=("y:out", "a:in", "b:in"), params=("a.size",), executor=SPATZ)
+spatz_exp = l1_kernel("l1_exp_fp16_spatz", operands=("y:out", "x:in"), params=("x.size",), executor=SPATZ)
+spatz_mul = l1_kernel("l1_mul_fp16_spatz", operands=("y:out", "a:in", "b:in"), params=("a.size",), executor=SPATZ)
+spatz_add = l1_kernel("l1_add_fp16_spatz", operands=("y:out", "a:in", "b:in"), params=("a.size",), executor=SPATZ)
 # spatz_rowscale: y[r, c] = x[r, c] * s[r], i.e. y = diag(s) x, on Spatz.
-spatz_rowscale = l1_kernel("l1_rowscale_fp16_spatz", operands=("y:out", "x:in", "s:in"), params=("x.shape[0]", "x.shape[1]"), executor=CORE)
+spatz_rowscale = l1_kernel("l1_rowscale_fp16_spatz", operands=("y:out", "x:in", "s:in"), params=("x.shape[0]", "x.shape[1]"), executor=SPATZ)
 # spatz_rowdiv: y[r, c] = x[r, c] / s[r], i.e. y = diag(s)^-1 x, on Spatz.
-spatz_rowdiv = l1_kernel("l1_rowdiv_fp16_spatz", operands=("y:out", "x:in", "s:in"), params=("x.shape[0]", "x.shape[1]"), executor=CORE)
+spatz_rowdiv = l1_kernel("l1_rowdiv_fp16_spatz", operands=("y:out", "x:in", "s:in"), params=("x.shape[0]", "x.shape[1]"), executor=SPATZ)
 
 @kernel("mgc_flat_attn_naive", check=(o_, o_gold), tol=0x11)
 def flat_attn_naive():

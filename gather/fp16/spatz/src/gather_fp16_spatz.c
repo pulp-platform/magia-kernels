@@ -5,14 +5,14 @@
 #include <stdint.h>
 #include <errno.h>
 
-#include "eventunit.h"
-#include "idma.h"
 #include "tile.h"
+#include "mg_idma.h"
+#include "mg_spatz.h"
+#include "mg_tile.h"
 
 #include "kernels_profiling_utils.h"
 
 #include "gather_fp16_spatz.h"
-#include "gather_fp16_spatz_params.h"
 #include "gather_fp16_spatz_task_bin.h"
 
 #define HID         get_hartid()
@@ -27,26 +27,22 @@ static int alloc_l1(void **params,
                     uint32_t axis)
 {
     volatile gather_fp16_spatz_params_t *gather_params;
-    uintptr_t shard_input;
-    uintptr_t shard_output;
-
-    uint32_t shard_iteration;
+    uint32_t num_batches;
     uint32_t batch_start;
     uint32_t batch_len;
     uint32_t in_batch_stride;
 
     if (axis == 1) {
-        shard_iteration = (in_shape[0] + NUM_HARTS - 1) / NUM_HARTS;
+        num_batches = in_shape[0];
     } else if (axis == 2) {
-        shard_iteration = (in_shape[0] * in_shape[1] + NUM_HARTS - 1) / NUM_HARTS;
+        num_batches = in_shape[0] * in_shape[1];
     } else if (axis == 3) {
-        shard_iteration = (in_shape[0] * in_shape[1] * in_shape[2] + NUM_HARTS - 1) / NUM_HARTS;
+        num_batches = in_shape[0] * in_shape[1] * in_shape[2];
     } else {
         return EINVAL;
     }
 
-    batch_start = HID * shard_iteration;
-    batch_len   = shard_iteration;
+    mg_split(num_batches, NUM_HARTS, HID, &batch_start, &batch_len);
 
     in_batch_stride = gather_dim_size * axis_length;
 
@@ -56,16 +52,14 @@ static int alloc_l1(void **params,
     if (!gather_params)
         return ENOMEM;
 
-    shard_input = l1_alloc(batch_len * in_batch_stride * sizeof(float16));
-    if (!shard_input)
+    gather_params->shard_input = (uintptr_t)l1_alloc(batch_len * in_batch_stride * sizeof(float16));
+    if (!gather_params->shard_input)
         return ENOMEM;
 
-    shard_output = l1_alloc(batch_len * axis_length * sizeof(float16));
-    if (!shard_output)
+    gather_params->shard_output = (uintptr_t)l1_alloc(batch_len * axis_length * sizeof(float16));
+    if (!gather_params->shard_output)
         return ENOMEM;
 
-    gather_params->shard_input     = shard_input;
-    gather_params->shard_output    = shard_output;
     gather_params->gather_dim_size = gather_dim_size;
     gather_params->axis_length     = axis_length;
     gather_params->batch_start     = batch_start;
@@ -79,13 +73,11 @@ static int alloc_l1(void **params,
 
 static int init_input_params(void *params, const float16 *data)
 {
-    volatile gather_fp16_spatz_params_t *gather_params;
-
+    volatile gather_fp16_spatz_params_t *gather_params = params;
     uint32_t in_batch_stride;
     uint32_t batch_start;
     uint32_t batch_len;
 
-    gather_params   = (volatile gather_fp16_spatz_params_t *)params;
     in_batch_stride = gather_params->gather_dim_size * gather_params->axis_length;
     batch_start     = gather_params->batch_start;
     batch_len       = gather_params->batch_len;
@@ -96,101 +88,35 @@ static int init_input_params(void *params, const float16 *data)
     /* This tile's batches [batch_start, batch_start+batch_len) are a contiguous L2 block.
        The Spatz task fully writes shard_output (axis_length per batch), so it is not zeroed
        here. */
-    idma_memcpy_1d(0,
-                   (uint32_t)(data + batch_start * in_batch_stride),
-                   (uint32_t)gather_params->shard_input,
-                   batch_len * in_batch_stride * sizeof(float16));
-    eu_idma_wait_a2o(WFE);
+    mg_idma_memcpy_1d_sync(WFE,
+                           0,
+                           (uint32_t)(data + batch_start * in_batch_stride),
+                           gather_params->shard_input,
+                           batch_len * in_batch_stride * sizeof(float16));
 
     return 0;
 }
 
-static int offload_spatz_task(void *params)
-{
-    int ret;
-
-    spatz_run_task_with_params(GATHER_FP16_SPATZ_TASK, (uint32_t)params);
-
-    ret = eu_spatz_wait(WFE);
-    if (ret == 0) {
-        printf("[CV32 (%d)] [%s] Wait on Spatz task completion failed with error: %d\n",
-               HID,
-               KERNEL_NAME,
-               ret);
-        goto exit;
-    }
-
-    ret = spatz_get_exit_code();
-
-exit:
-    return ret;
-}
-
-/*
- * Gather on this tile's Spatz, for operands that are already in this tile's L1: no sharding across
- * tiles, no L1 allocation and no L2 transfers.
- */
-void MAGIA_gather_fp16_spatz_l1(const float16 *data,
-                                uint32_t in_shape[4],
-                                float16 *output,
-                                uint32_t batch,
-                                uint32_t gather_dim_size,
-                                uint32_t axis_length,
-                                uint32_t index,
-                                uint32_t axis)
-{
-    uint32_t batch_len;
-    int ret;
-
-    if (axis == 0 || axis > 3) {
-        printf("[CV32 (%d)] [%s] Unsupported gather axis: %d\n", HID, KERNEL_NAME, (int)axis);
-        return;
-    }
-
-    batch_len = 1;
-    for (uint32_t d = 0; d < axis; d++)
-        batch_len *= in_shape[d];
-
-    volatile gather_fp16_spatz_params_t params = {
-        .shard_input     = (uintptr_t)data,
-        .shard_output    = (uintptr_t)output,
-        .batch_start     = 0,
-        .batch_len       = batch_len,
-        .gather_dim_size = gather_dim_size,
-        .axis_length     = axis_length,
-        .index           = index,
-    };
-
-    ret = offload_spatz_task((void *)&params);
-    if (ret != 0) {
-        printf("[CV32 (%d)] [%s] Spatz task offloading failed with error: %d\n",
-               HID,
-               KERNEL_NAME,
-               ret);
-    }
-}
-
 static int store_result(void *params, float16 *gather_result)
 {
-    volatile gather_fp16_spatz_params_t *gather_params;
+    volatile gather_fp16_spatz_params_t *gather_params = params;
     uint32_t axis_length;
     uint32_t start;
     uint32_t len;
 
-    gather_params = (volatile gather_fp16_spatz_params_t *)params;
-    axis_length   = gather_params->axis_length;
-    start         = gather_params->batch_start;
-    len           = gather_params->batch_len;
+    axis_length = gather_params->axis_length;
+    start       = gather_params->batch_start;
+    len         = gather_params->batch_len;
 
     if (len == 0)
         return 0;
 
     /* This tile's output batches [batch_start, batch_start+batch_len) are contiguous in L2. */
-    idma_memcpy_1d(1,
-                   (uint32_t)(gather_result + start * axis_length),
-                   (uint32_t)gather_params->shard_output,
-                   len * axis_length * sizeof(float16));
-    eu_idma_wait_o2a(WFE);
+    mg_idma_memcpy_1d_sync(WFE,
+                           1,
+                           (uint32_t)(gather_result + start * axis_length),
+                           gather_params->shard_output,
+                           len * axis_length * sizeof(float16));
 
     return 0;
 }
@@ -233,12 +159,9 @@ void MAGIA_gather_fp16_spatz(const float16 *data,
         return;
     }
 
-    PROF_PHASE(prof_cyc_compute, ret, offload_spatz_task((void *)params));
+    PROF_PHASE(prof_cyc_compute, ret, mg_spatz_call(GATHER_FP16_SPATZ_TASK, (const void *)params));
     if (ret != 0) {
-        printf("[CV32 (%d)] [%s] Spatz task offloading failed with error: %d\n",
-               HID,
-               KERNEL_NAME,
-               ret);
+        printf("[CV32 (%d)] [%s] Spatz task failed with exit code: %d\n", HID, KERNEL_NAME, ret);
         return;
     }
 
@@ -246,4 +169,47 @@ void MAGIA_gather_fp16_spatz(const float16 *data,
     if (ret != 0) {
         printf("[CV32 (%d)] [%s] Result write back failed with error: %d\n", HID, KERNEL_NAME, ret);
     }
+}
+
+void MAGIA_gather_fp16_spatz_l1_start(gather_fp16_spatz_params_t *p,
+                                      const float16 *data,
+                                      uint32_t in_shape[4],
+                                      float16 *output,
+                                      uint32_t batch,
+                                      uint32_t gather_dim_size,
+                                      uint32_t axis_length,
+                                      uint32_t index,
+                                      uint32_t axis,
+                                      mg_event_t *event)
+{
+    gather_fp16_spatz_params_set(
+        p, data, in_shape, output, batch, gather_dim_size, axis_length, index, axis);
+    mg_spatz_run(WFE, GATHER_FP16_SPATZ_TASK, p, event, 0);
+}
+
+void MAGIA_gather_fp16_spatz_l1(const float16 *data,
+                                uint32_t in_shape[4],
+                                float16 *output,
+                                uint32_t batch,
+                                uint32_t gather_dim_size,
+                                uint32_t axis_length,
+                                uint32_t index,
+                                uint32_t axis)
+{
+    gather_fp16_spatz_params_t params;
+    mg_event_t event;
+
+    if (axis == 0 || axis > 3) {
+        printf("[CV32 (%d)] [%s] Unsupported gather axis: %d\n", HID, KERNEL_NAME, (int)axis);
+        return;
+    }
+
+    MAGIA_gather_fp16_spatz_l1_start(
+        &params, data, in_shape, output, batch, gather_dim_size, axis_length, index, axis, &event);
+    mg_spatz_wait(WFE, &event);
+    if (mg_spatz_exit_code() != 0)
+        printf("[CV32 (%d)] [%s] Spatz task failed with exit code: %d\n",
+               HID,
+               KERNEL_NAME,
+               mg_spatz_exit_code());
 }

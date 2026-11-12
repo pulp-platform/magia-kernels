@@ -5,12 +5,12 @@
 #include <stdint.h>
 #include <errno.h>
 
-#include "eventunit.h"
-#include "idma.h"
 #include "tile.h"
+#include "mg_idma.h"
+#include "mg_spatz.h"
+#include "mg_tile.h"
 
 #include "rope_fp16_spatz.h"
-#include "rope_fp16_spatz_params.h"
 #include "rope_fp16_spatz_task_bin.h"
 
 #define HID         get_hartid()
@@ -23,18 +23,10 @@ static int alloc_l1(void **params, uint32_t rows, uint32_t n_heads, uint32_t hea
     uint32_t cos;
     uint32_t sin;
 
-    size_t r_start;
-    size_t r_end;
-    size_t r_len;
-    size_t shard;
-    size_t left;
+    uint32_t r_start;
+    uint32_t r_len;
 
-    shard = rows / NUM_HARTS;
-    left  = rows % NUM_HARTS;
-
-    r_start = HID * shard + (HID < left ? HID : left);
-    r_end   = r_start + shard + (HID < left ? 1 : 0);
-    r_len   = r_end - r_start;
+    mg_split(rows, NUM_HARTS, HID, &r_start, &r_len);
 
     l1_alloc_init();
 
@@ -87,79 +79,19 @@ static int init_input_params(void *params, const float16 *X, const float16 *cos,
         return 0;
 
     /* This tile's rows [r_start, r_start+r_len) are contiguous in X, cos and sin. */
-    idma_memcpy_1d(0,
-                   (uint32_t)(X + r_start * width),
-                   (uint32_t)rope_params->shard_X,
-                   r_len * width * sizeof(float16));
-    eu_idma_wait_a2o(WFE);
+    mg_idma_memcpy_1d_sync(WFE,
+                           0,
+                           (uint32_t)(X + r_start * width),
+                           rope_params->shard_X,
+                           r_len * width * sizeof(float16));
 
-    idma_memcpy_1d(0,
-                   (uint32_t)(cos + r_start * half),
-                   (uint32_t)rope_params->cos,
-                   r_len * half * sizeof(float16));
-    eu_idma_wait_a2o(WFE);
+    mg_idma_memcpy_1d_sync(
+        WFE, 0, (uint32_t)(cos + r_start * half), rope_params->cos, r_len * half * sizeof(float16));
 
-    idma_memcpy_1d(0,
-                   (uint32_t)(sin + r_start * half),
-                   (uint32_t)rope_params->sin,
-                   r_len * half * sizeof(float16));
-    eu_idma_wait_a2o(WFE);
+    mg_idma_memcpy_1d_sync(
+        WFE, 0, (uint32_t)(sin + r_start * half), rope_params->sin, r_len * half * sizeof(float16));
 
     return 0;
-}
-
-static int offload_spatz_task(void *params)
-{
-    int ret;
-
-    spatz_run_task_with_params(ROPE_FP16_SPATZ_TASK, (uint32_t)params);
-
-    ret = eu_spatz_wait(WFE);
-    if (ret == 0) {
-        printf("[CV32 (%d)] [%s] Wait on Spatz task completion failed with error: %d\n",
-               HID,
-               KERNEL_NAME,
-               ret);
-        goto exit;
-    }
-
-    ret = spatz_get_exit_code();
-
-exit:
-    return ret;
-}
-
-/*
- * RoPE of rows already in this tile's L1: no sharding across tiles, no L1 allocation and no L2
- * transfers. Y may alias X.
- */
-void MAGIA_rope_fp16_spatz_l1(const float16 *X,
-                              const float16 *cos,
-                              const float16 *sin,
-                              uint32_t rows,
-                              uint32_t n_heads,
-                              uint32_t head_dim,
-                              float16 *Y)
-{
-    volatile rope_fp16_spatz_params_t params = {
-        .shard_X  = (uintptr_t)X,
-        .shard_Y  = (uintptr_t)Y,
-        .cos      = (uintptr_t)cos,
-        .sin      = (uintptr_t)sin,
-        .r_start  = 0,
-        .r_len    = rows,
-        .n_heads  = n_heads,
-        .head_dim = head_dim,
-    };
-    int ret;
-
-    ret = offload_spatz_task((void *)&params);
-    if (ret != 0) {
-        printf("[CV32 (%d)] [%s] Spatz task offloading failed with error: %d\n",
-               HID,
-               KERNEL_NAME,
-               ret);
-    }
 }
 
 static int store_result(void *params, float16 *Y)
@@ -178,11 +110,11 @@ static int store_result(void *params, float16 *Y)
         return 0;
 
     /* This tile's output rows are contiguous in Y. */
-    idma_memcpy_1d(1,
-                   (uint32_t)(Y + r_start * width),
-                   (uint32_t)rope_params->shard_Y,
-                   r_len * width * sizeof(float16));
-    eu_idma_wait_o2a(WFE);
+    mg_idma_memcpy_1d_sync(WFE,
+                           1,
+                           (uint32_t)(Y + r_start * width),
+                           rope_params->shard_Y,
+                           r_len * width * sizeof(float16));
 
     return 0;
 }
@@ -213,12 +145,9 @@ void MAGIA_rope_fp16_spatz(const float16 *X,
         return;
     }
 
-    ret = offload_spatz_task((void *)params);
+    ret = mg_spatz_call(ROPE_FP16_SPATZ_TASK, (const void *)params);
     if (ret != 0) {
-        printf("[CV32 (%d)] [%s] Spatz task offloading failed with error: %d\n",
-               HID,
-               KERNEL_NAME,
-               ret);
+        printf("[CV32 (%d)] [%s] Spatz task failed with exit code: %d\n", HID, KERNEL_NAME, ret);
         return;
     }
 
@@ -226,4 +155,38 @@ void MAGIA_rope_fp16_spatz(const float16 *X,
     if (ret != 0) {
         printf("[CV32 (%d)] [%s] Result write back failed with error: %d\n", HID, KERNEL_NAME, ret);
     }
+}
+
+void MAGIA_rope_fp16_spatz_l1_start(rope_fp16_spatz_params_t *p,
+                                    const float16 *X,
+                                    const float16 *cos,
+                                    const float16 *sin,
+                                    uint32_t rows,
+                                    uint32_t n_heads,
+                                    uint32_t head_dim,
+                                    float16 *Y,
+                                    mg_event_t *event)
+{
+    rope_fp16_spatz_params_set(p, X, cos, sin, rows, n_heads, head_dim, Y);
+    mg_spatz_run(WFE, ROPE_FP16_SPATZ_TASK, p, event, 0);
+}
+
+void MAGIA_rope_fp16_spatz_l1(const float16 *X,
+                              const float16 *cos,
+                              const float16 *sin,
+                              uint32_t rows,
+                              uint32_t n_heads,
+                              uint32_t head_dim,
+                              float16 *Y)
+{
+    rope_fp16_spatz_params_t params;
+    mg_event_t event;
+
+    MAGIA_rope_fp16_spatz_l1_start(&params, X, cos, sin, rows, n_heads, head_dim, Y, &event);
+    mg_spatz_wait(WFE, &event);
+    if (mg_spatz_exit_code() != 0)
+        printf("[CV32 (%d)] [%s] Spatz task failed with exit code: %d\n",
+               HID,
+               KERNEL_NAME,
+               mg_spatz_exit_code());
 }

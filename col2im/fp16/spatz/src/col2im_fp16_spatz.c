@@ -5,14 +5,14 @@
 #include <stdint.h>
 #include <errno.h>
 
-#include "eventunit.h"
-#include "idma.h"
 #include "tile.h"
+#include "mg_idma.h"
+#include "mg_spatz.h"
+#include "mg_tile.h"
 
 #include "kernels_profiling_utils.h"
 
 #include "col2im_fp16_spatz.h"
-#include "col2im_fp16_spatz_params.h"
 #include "col2im_fp16_spatz_task_bin.h"
 
 #define HID         get_hartid()
@@ -37,20 +37,12 @@ static int allocate_l1(void **params,
     uintptr_t shard_X;
     uintptr_t shard_Y;
 
-    uint32_t shard;
-    uint32_t left;
     uint32_t c_start;
-    uint32_t c_end;
     uint32_t c_len;
     uint32_t input_elems;
     uint32_t output_elems;
 
-    shard = channels / NUM_HARTS;
-    left  = channels % NUM_HARTS;
-
-    c_start = HID * shard + (HID < left ? HID : left);
-    c_end   = c_start + shard + (HID < left ? 1 : 0);
-    c_len   = c_end - c_start;
+    mg_split(channels, NUM_HARTS, HID, &c_start, &c_len);
 
     l1_alloc_init();
 
@@ -131,13 +123,13 @@ static int init_input_params(void *params, const float16 *input)
     /* Column buffer: for each batch this tile's channels [c_start, c_start+c_len) are a
        contiguous run of c_len*bbl elements. Gather them into the packed L1 shard with a 2D
        transfer -- one run per batch, source stride spanning the full channel count. */
-    idma_memcpy_2d(0,
-                   (uint32_t)(input + c_start * bbl),
-                   (uint32_t)shard_X,
-                   c_len * bbl * sizeof(float16),
-                   tot_c * bbl * sizeof(float16),
-                   batch);
-    eu_idma_wait_a2o(WFE);
+    mg_idma_memcpy_2d_sync(WFE,
+                           0,
+                           (uint32_t)(input + c_start * bbl),
+                           (uint32_t)shard_X,
+                           c_len * bbl * sizeof(float16),
+                           tot_c * bbl * sizeof(float16),
+                           batch);
 
     /* col2im scatters with accumulation, so the output shard must start zeroed. */
     for (uint32_t i = 0; i < (batch * c_len * image_h * image_w); i++) {
@@ -145,81 +137,6 @@ static int init_input_params(void *params, const float16 *input)
     }
 
     return 0;
-}
-
-static int offload_spatz_task(void *params)
-{
-    int ret;
-
-    spatz_run_task_with_params(COL2IM_FP16_SPATZ_TASK, params);
-
-    ret = eu_spatz_wait(WFE);
-    if (ret == 0) {
-        printf("[CV32 (%d)] [%s] Wait on Spatz task completion failed with error: %d\n",
-               HID,
-               KERNEL_NAME,
-               ret);
-        goto exit;
-    }
-
-    ret = spatz_get_exit_code();
-
-exit:
-    return ret;
-}
-
-/*
- * Col2Im on this tile's Spatz, for operands that are already in this tile's L1: no sharding across
- * tiles, no L1 allocation and no L2 transfers.
- */
-void MAGIA_col2im_fp16_spatz_l1(const float16 *input,
-                                float16 *output,
-                                uint32_t batch,
-                                uint32_t channels,
-                                uint32_t image_h,
-                                uint32_t image_w,
-                                uint32_t block_h,
-                                uint32_t block_w,
-                                uint32_t pad_h,
-                                uint32_t pad_w,
-                                uint32_t stride_h,
-                                uint32_t stride_w,
-                                uint32_t dilation_h,
-                                uint32_t dilation_w,
-                                uint32_t l_len)
-{
-    volatile col2im_fp16_spatz_params_t params = {
-        .shard_X        = (uintptr_t)input,
-        .shard_Y        = (uintptr_t)output,
-        .batch          = batch,
-        .total_channels = channels,
-        .c_start        = 0,
-        .c_len          = channels,
-        .image_h        = image_h,
-        .image_w        = image_w,
-        .block_h        = block_h,
-        .block_w        = block_w,
-        .pad_h          = pad_h,
-        .pad_w          = pad_w,
-        .stride_h       = stride_h,
-        .stride_w       = stride_w,
-        .dilation_h     = dilation_h,
-        .dilation_w     = dilation_w,
-        .l_len          = l_len,
-    };
-    int ret;
-
-    /* col2im scatters with accumulation, so the output must start zeroed. */
-    for (uint32_t i = 0; i < batch * channels * image_h * image_w; i++)
-        mmio_fp16((uintptr_t)(output + i)) = 0;
-
-    ret = offload_spatz_task((void *)&params);
-    if (ret != 0) {
-        printf("[CV32 (%d)] [%s] Spatz task offloading failed with error: %d\n",
-               HID,
-               KERNEL_NAME,
-               ret);
-    }
 }
 
 static int store_result(void *params, float16 *output)
@@ -252,13 +169,13 @@ static int store_result(void *params, float16 *output)
     /* For each batch this tile's output channels [c_start, c_start+c_len) are a contiguous
        run of c_len*ihw elements in L2. Scatter the packed L1 shard back with a 2D transfer
        -- one run per batch, dest stride spanning the full channel count. */
-    idma_memcpy_2d(1,
-                   (uint32_t)(output + c_start * ihw),
-                   (uint32_t)shard_Y,
-                   c_len * ihw * sizeof(float16),
-                   tot_c * ihw * sizeof(float16),
-                   batch);
-    eu_idma_wait_o2a(WFE);
+    mg_idma_memcpy_2d_sync(WFE,
+                           1,
+                           (uint32_t)(output + c_start * ihw),
+                           (uint32_t)shard_Y,
+                           c_len * ihw * sizeof(float16),
+                           tot_c * ihw * sizeof(float16),
+                           batch);
 
     return 0;
 }
@@ -284,7 +201,7 @@ void MAGIA_col2im_fp16_spatz(const float16 *input,
 
     PROF_PHASE(prof_cyc_alloc,
                ret,
-               allocate_l1(&params,
+               allocate_l1((void **)&params,
                            batch,
                            channels,
                            image_h,
@@ -303,7 +220,7 @@ void MAGIA_col2im_fp16_spatz(const float16 *input,
         return;
     }
 
-    PROF_PHASE(prof_cyc_data_in, ret, init_input_params(params, input));
+    PROF_PHASE(prof_cyc_data_in, ret, init_input_params((void *)params, input));
     if (ret != 0) {
         printf("[CV32 (%d)] [%s] Params initialization failed with error: %d\n",
                HID,
@@ -312,12 +229,9 @@ void MAGIA_col2im_fp16_spatz(const float16 *input,
         return;
     }
 
-    PROF_PHASE(prof_cyc_compute, ret, offload_spatz_task((void *)params));
+    PROF_PHASE(prof_cyc_compute, ret, mg_spatz_call(COL2IM_FP16_SPATZ_TASK, (const void *)params));
     if (ret != 0) {
-        printf("[CV32 (%d)] [%s] Spatz task offloading failed with error: %d\n",
-               HID,
-               KERNEL_NAME,
-               ret);
+        printf("[CV32 (%d)] [%s] Spatz task failed with exit code: %d\n", HID, KERNEL_NAME, ret);
         return;
     }
 
@@ -325,4 +239,90 @@ void MAGIA_col2im_fp16_spatz(const float16 *input,
     if (ret != 0) {
         printf("[CV32 (%d)] [%s] Result write back failed with error: %d\n", HID, KERNEL_NAME, ret);
     }
+}
+
+void MAGIA_col2im_fp16_spatz_l1_start(col2im_fp16_spatz_params_t *p,
+                                      const float16 *input,
+                                      float16 *output,
+                                      uint32_t batch,
+                                      uint32_t channels,
+                                      uint32_t image_h,
+                                      uint32_t image_w,
+                                      uint32_t block_h,
+                                      uint32_t block_w,
+                                      uint32_t pad_h,
+                                      uint32_t pad_w,
+                                      uint32_t stride_h,
+                                      uint32_t stride_w,
+                                      uint32_t dilation_h,
+                                      uint32_t dilation_w,
+                                      uint32_t l_len,
+                                      mg_event_t *event)
+{
+    col2im_fp16_spatz_params_set(p,
+                                 input,
+                                 output,
+                                 batch,
+                                 channels,
+                                 image_h,
+                                 image_w,
+                                 block_h,
+                                 block_w,
+                                 pad_h,
+                                 pad_w,
+                                 stride_h,
+                                 stride_w,
+                                 dilation_h,
+                                 dilation_w,
+                                 l_len);
+
+    /* col2im scatters with accumulation, so the output must start zeroed. */
+    for (uint32_t i = 0; i < batch * channels * image_h * image_w; i++)
+        mmio_fp16((uintptr_t)(output + i)) = 0;
+
+    mg_spatz_run(WFE, COL2IM_FP16_SPATZ_TASK, p, event, 0);
+}
+
+void MAGIA_col2im_fp16_spatz_l1(const float16 *input,
+                                float16 *output,
+                                uint32_t batch,
+                                uint32_t channels,
+                                uint32_t image_h,
+                                uint32_t image_w,
+                                uint32_t block_h,
+                                uint32_t block_w,
+                                uint32_t pad_h,
+                                uint32_t pad_w,
+                                uint32_t stride_h,
+                                uint32_t stride_w,
+                                uint32_t dilation_h,
+                                uint32_t dilation_w,
+                                uint32_t l_len)
+{
+    col2im_fp16_spatz_params_t params;
+    mg_event_t event;
+
+    MAGIA_col2im_fp16_spatz_l1_start(&params,
+                                     input,
+                                     output,
+                                     batch,
+                                     channels,
+                                     image_h,
+                                     image_w,
+                                     block_h,
+                                     block_w,
+                                     pad_h,
+                                     pad_w,
+                                     stride_h,
+                                     stride_w,
+                                     dilation_h,
+                                     dilation_w,
+                                     l_len,
+                                     &event);
+    mg_spatz_wait(WFE, &event);
+    if (mg_spatz_exit_code() != 0)
+        printf("[CV32 (%d)] [%s] Spatz task failed with exit code: %d\n",
+               HID,
+               KERNEL_NAME,
+               mg_spatz_exit_code());
 }

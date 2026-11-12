@@ -5,14 +5,14 @@
 #include <stdint.h>
 #include <errno.h>
 
-#include "eventunit.h"
-#include "idma.h"
 #include "tile.h"
+#include "mg_idma.h"
+#include "mg_spatz.h"
+#include "mg_tile.h"
 
 #include "kernels_profiling_utils.h"
 
 #include "slice_fp16_spatz.h"
-#include "slice_fp16_spatz_params.h"
 #include "slice_fp16_spatz_task_bin.h"
 
 #define HID         get_hartid()
@@ -29,21 +29,13 @@ static int alloc_l1(void **params,
     uint32_t shard_X;
     uint32_t shard_Y;
 
-    size_t start_outer;
-    size_t end_outer;
-    size_t len_outer;
-    size_t elems;
-    size_t left;
+    uint32_t start_outer;
+    uint32_t len_outer;
 
     size_t x_size;
     size_t y_size;
 
-    elems = outer_dim / NUM_HARTS;
-    left  = outer_dim % NUM_HARTS;
-
-    start_outer = HID * elems + (HID < left ? HID : left);
-    end_outer   = start_outer + elems + (HID < left ? 1 : 0);
-    len_outer   = end_outer - start_outer;
+    mg_split(outer_dim, NUM_HARTS, HID, &start_outer, &len_outer);
 
     x_size = len_outer * slice_dim * inner_dim;
     y_size = len_outer * out_slice_dim * inner_dim;
@@ -100,64 +92,10 @@ static int init_input_params(void *params, const float16 *data)
 
     /* Load this tile's contiguous [len_outer, slice_dim, inner] block; the Spatz
        task extracts the slice and fully writes shard_Y (so no zeroing needed). */
-    idma_memcpy_1d(0, (uint32_t)(data + global_offset), (uint32_t)slice_params->shard_X, x_bytes);
-    eu_idma_wait_a2o(WFE);
+    mg_idma_memcpy_1d_sync(
+        WFE, 0, (uint32_t)(data + global_offset), slice_params->shard_X, x_bytes);
 
     return 0;
-}
-
-static int offload_spatz_task(void *params)
-{
-    int ret;
-
-    spatz_run_task_with_params(SLICE_FP16_SPATZ_TASK, params);
-
-    ret = eu_spatz_wait(WFE);
-    if (ret == 0) {
-        printf("[CV32 (%d)] [%s] Wait on Spatz task completion failed with error: %d\n",
-               HID,
-               KERNEL_NAME,
-               ret);
-        goto exit;
-    }
-
-    ret = spatz_get_exit_code();
-
-exit:
-    return ret;
-}
-
-/*
- * Slice on this tile's Spatz, for operands that are already in this tile's L1: no sharding across
- * tiles, no L1 allocation and no L2 transfers.
- */
-void MAGIA_slice_fp16_spatz_l1(const float16 *data,
-                               float16 *sliced,
-                               uint32_t outer_dim,
-                               uint32_t slice_dim,
-                               uint32_t inner_dim,
-                               uint32_t start_idx,
-                               uint32_t out_slice_dim)
-{
-    volatile slice_fp16_spatz_params_t params = {
-        .shard_X       = (uintptr_t)data,
-        .shard_Y       = (uintptr_t)sliced,
-        .slice_dim     = slice_dim,
-        .out_slice_dim = out_slice_dim,
-        .inner_dim     = inner_dim,
-        .start_idx     = start_idx,
-        .start_outer   = 0,
-        .len_outer     = outer_dim,
-    };
-    int ret;
-
-    ret = offload_spatz_task((void *)&params);
-    if (ret != 0) {
-        printf("[CV32 (%d)] [%s] Spatz task offloading failed with error: %d\n",
-               HID,
-               KERNEL_NAME,
-               ret);
-    }
 }
 
 static int store_result(void *params, float16 *sliced)
@@ -181,8 +119,8 @@ static int store_result(void *params, float16 *sliced)
     y_bytes       = len_outer * out_stride * sizeof(float16);
 
     /* This tile's output rows [start_outer, start_outer+len_outer) are contiguous in L2. */
-    idma_memcpy_1d(1, (uint32_t)(sliced + global_offset), (uint32_t)slice_params->shard_Y, y_bytes);
-    eu_idma_wait_o2a(WFE);
+    mg_idma_memcpy_1d_sync(
+        WFE, 1, (uint32_t)(sliced + global_offset), slice_params->shard_Y, y_bytes);
 
     return 0;
 }
@@ -198,15 +136,16 @@ void MAGIA_slice_fp16_spatz(const float16 *data,
     int ret;
     volatile slice_fp16_spatz_params_t *params;
 
-    PROF_PHASE(prof_cyc_alloc,
-               ret,
-               alloc_l1(&params, outer_dim, slice_dim, inner_dim, start_idx, out_slice_dim));
+    PROF_PHASE(
+        prof_cyc_alloc,
+        ret,
+        alloc_l1((void **)&params, outer_dim, slice_dim, inner_dim, start_idx, out_slice_dim));
     if (ret != 0) {
         printf("[CV32 (%d)] [%s] L1 allocation failed with error: %d\n", HID, KERNEL_NAME, ret);
         return;
     }
 
-    PROF_PHASE(prof_cyc_data_in, ret, init_input_params(params, data));
+    PROF_PHASE(prof_cyc_data_in, ret, init_input_params((void *)params, data));
     if (ret != 0) {
         printf("[CV32 (%d)] [%s] Params initialization failed with error: %d\n",
                HID,
@@ -215,17 +154,50 @@ void MAGIA_slice_fp16_spatz(const float16 *data,
         return;
     }
 
-    PROF_PHASE(prof_cyc_compute, ret, offload_spatz_task(params));
+    PROF_PHASE(prof_cyc_compute, ret, mg_spatz_call(SLICE_FP16_SPATZ_TASK, (const void *)params));
     if (ret != 0) {
-        printf("[CV32 (%d)] [%s] Spatz task offloading failed with error: %d\n",
-               HID,
-               KERNEL_NAME,
-               ret);
+        printf("[CV32 (%d)] [%s] Spatz task failed with exit code: %d\n", HID, KERNEL_NAME, ret);
         return;
     }
 
-    PROF_PHASE(prof_cyc_data_out, ret, store_result(params, sliced));
+    PROF_PHASE(prof_cyc_data_out, ret, store_result((void *)params, sliced));
     if (ret != 0) {
         printf("[CV32 (%d)] [%s] Result write back failed with error: %d\n", HID, KERNEL_NAME, ret);
     }
+}
+
+void MAGIA_slice_fp16_spatz_l1_start(slice_fp16_spatz_params_t *p,
+                                     const float16 *data,
+                                     float16 *sliced,
+                                     uint32_t outer_dim,
+                                     uint32_t slice_dim,
+                                     uint32_t inner_dim,
+                                     uint32_t start_idx,
+                                     uint32_t out_slice_dim,
+                                     mg_event_t *event)
+{
+    slice_fp16_spatz_params_set(
+        p, data, sliced, outer_dim, slice_dim, inner_dim, start_idx, out_slice_dim);
+    mg_spatz_run(WFE, SLICE_FP16_SPATZ_TASK, p, event, 0);
+}
+
+void MAGIA_slice_fp16_spatz_l1(const float16 *data,
+                               float16 *sliced,
+                               uint32_t outer_dim,
+                               uint32_t slice_dim,
+                               uint32_t inner_dim,
+                               uint32_t start_idx,
+                               uint32_t out_slice_dim)
+{
+    slice_fp16_spatz_params_t params;
+    mg_event_t event;
+
+    MAGIA_slice_fp16_spatz_l1_start(
+        &params, data, sliced, outer_dim, slice_dim, inner_dim, start_idx, out_slice_dim, &event);
+    mg_spatz_wait(WFE, &event);
+    if (mg_spatz_exit_code() != 0)
+        printf("[CV32 (%d)] [%s] Spatz task failed with exit code: %d\n",
+               HID,
+               KERNEL_NAME,
+               mg_spatz_exit_code());
 }

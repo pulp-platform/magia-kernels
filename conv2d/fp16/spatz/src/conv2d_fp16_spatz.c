@@ -5,14 +5,14 @@
 #include <stdint.h>
 #include <errno.h>
 
-#include "eventunit.h"
-#include "idma.h"
 #include "tile.h"
+#include "mg_idma.h"
+#include "mg_spatz.h"
+#include "mg_tile.h"
 
 #include "kernels_profiling_utils.h"
 
 #include "conv2d_fp16_spatz.h"
-#include "conv2d_fp16_spatz_params.h"
 #include "conv2d_fp16_spatz_task_bin.h"
 
 #define HID         get_hartid()
@@ -40,11 +40,8 @@ static int alloc_l1(void **params,
     size_t c_in;
     size_t c_out;
     size_t iterations;
-    size_t shard;
-    size_t left;
-    size_t iter_start;
-    size_t iter_end;
-    size_t iter_len;
+    uint32_t iter_start;
+    uint32_t iter_len;
     size_t input_HW_len;
     size_t weight_HW_len;
     size_t output_HW_len;
@@ -54,12 +51,7 @@ static int alloc_l1(void **params,
     c_out      = output_shape[1];
     iterations = n * c_out;
 
-    shard = iterations / NUM_HARTS;
-    left  = iterations % NUM_HARTS;
-
-    iter_start = HID * shard + (HID < left ? HID : left);
-    iter_end   = iter_start + shard + (HID < left ? 1 : 0);
-    iter_len   = iter_end - iter_start;
+    mg_split(iterations, NUM_HARTS, HID, &iter_start, &iter_len);
 
     input_HW_len  = input_shape[2] * input_shape[3];
     weight_HW_len = kernel_h * kernel_w;
@@ -93,8 +85,8 @@ static int alloc_l1(void **params,
     conv_params->shard_Y    = shard_Y;
     conv_params->n_batches  = (uint32_t)n;
     conv_params->c_out      = (uint32_t)c_out;
-    conv_params->iter_start = (uint32_t)iter_start;
-    conv_params->iter_len   = (uint32_t)iter_len;
+    conv_params->iter_start = iter_start;
+    conv_params->iter_len   = iter_len;
     conv_params->c_in_g     = input_shape[1] / group;
     conv_params->c_out_g    = output_shape[1] / group;
     conv_params->h_in       = input_shape[2];
@@ -134,94 +126,20 @@ static int init_input_params(void *params, const float16 *X, const float16 *W, c
     /* Every tile needs the full input and full weights (each output channel reads all input
        channels), both contiguous in L2 -> straight 1D transfers. The Spatz task writes every
        output element, so shard_Y is not zeroed here. */
-    idma_memcpy_1d(0, (uint32_t)X, (uint32_t)conv_params->shard_X, total_in * sizeof(float16));
-    eu_idma_wait_a2o(WFE);
-    idma_memcpy_1d(0, (uint32_t)W, (uint32_t)conv_params->shard_W, total_w * sizeof(float16));
-    eu_idma_wait_a2o(WFE);
+    mg_idma_memcpy_1d_sync(
+        WFE, 0, (uint32_t)X, (uint32_t)conv_params->shard_X, total_in * sizeof(float16));
+    mg_idma_memcpy_1d_sync(
+        WFE, 0, (uint32_t)W, (uint32_t)conv_params->shard_W, total_w * sizeof(float16));
 
     if (conv_params->has_bias) {
-        idma_memcpy_1d(0, (uint32_t)B, (uint32_t)conv_params->shard_B, c_out * sizeof(float16));
-        eu_idma_wait_a2o(WFE);
+        mg_idma_memcpy_1d_sync(
+            WFE, 0, (uint32_t)B, (uint32_t)conv_params->shard_B, c_out * sizeof(float16));
     } else {
         for (uint32_t i = 0; i < c_out; i++)
             mmio_fp16(conv_params->shard_B + i * sizeof(float16)) = 0.0f;
     }
 
     return 0;
-}
-
-static int offload_spatz_task(void *params)
-{
-    int ret;
-
-    spatz_run_task_with_params(CONV2D_FP16_SPATZ_TASK, (uint32_t)params);
-
-    ret = eu_spatz_wait(WFE);
-    if (ret == 0) {
-        printf("[CV32 (%d)] [%s] Wait on Spatz task completion failed with error: %d\n",
-               HID,
-               KERNEL_NAME,
-               ret);
-        goto exit;
-    }
-
-    ret = spatz_get_exit_code();
-
-exit:
-    return ret;
-}
-
-/*
- * Conv2D on this tile's Spatz, for operands that are already in this tile's L1: no sharding across
- * tiles, no L1 allocation and no L2 transfers.
- */
-void MAGIA_conv2d_fp16_spatz_l1(const float16 *X,
-                                const float16 *W,
-                                const float16 *B,
-                                float16 *Y,
-                                uint32_t input_shape[4],
-                                uint32_t output_shape[4],
-                                uint32_t kernel_h,
-                                uint32_t kernel_w,
-                                uint32_t stride_h,
-                                uint32_t stride_w,
-                                uint32_t pad_h,
-                                uint32_t pad_w,
-                                uint32_t group,
-                                int has_bias)
-{
-    volatile conv2d_fp16_spatz_params_t params = {
-        .shard_X    = (uintptr_t)X,
-        .shard_W    = (uintptr_t)W,
-        .shard_B    = (uintptr_t)B,
-        .shard_Y    = (uintptr_t)Y,
-        .has_bias   = (uint32_t)has_bias,
-        .n_batches  = input_shape[0],
-        .c_out      = output_shape[1],
-        .iter_start = 0,
-        .iter_len   = input_shape[0] * output_shape[1],
-        .c_in_g     = input_shape[1] / group,
-        .c_out_g    = output_shape[1] / group,
-        .h_in       = input_shape[2],
-        .w_in       = input_shape[3],
-        .h_out      = output_shape[2],
-        .w_out      = output_shape[3],
-        .kernel_h   = kernel_h,
-        .kernel_w   = kernel_w,
-        .stride_h   = stride_h,
-        .stride_w   = stride_w,
-        .pad_h      = pad_h,
-        .pad_w      = pad_w,
-    };
-    int ret;
-
-    ret = offload_spatz_task((void *)&params);
-    if (ret != 0) {
-        printf("[CV32 (%d)] [%s] Spatz task offloading failed with error: %d\n",
-               HID,
-               KERNEL_NAME,
-               ret);
-    }
 }
 
 static int store_result(void *params, float16 *Y)
@@ -240,11 +158,11 @@ static int store_result(void *params, float16 *Y)
         return 0;
 
     /* This tile's output planes [iter_start, iter_start+iter_len) are contiguous in L2. */
-    idma_memcpy_1d(1,
-                   (uint32_t)(Y + iter_start * out_hw_len),
-                   (uint32_t)conv_params->shard_Y,
-                   iter_len * out_hw_len * sizeof(float16));
-    eu_idma_wait_o2a(WFE);
+    mg_idma_memcpy_1d_sync(WFE,
+                           1,
+                           (uint32_t)(Y + iter_start * out_hw_len),
+                           (uint32_t)conv_params->shard_Y,
+                           iter_len * out_hw_len * sizeof(float16));
 
     return 0;
 }
@@ -269,7 +187,7 @@ void MAGIA_conv2d_fp16_spatz(const float16 *X,
 
     PROF_PHASE(prof_cyc_alloc,
                ret,
-               alloc_l1(&params,
+               alloc_l1((void **)&params,
                         input_shape,
                         output_shape,
                         kernel_h,
@@ -285,7 +203,7 @@ void MAGIA_conv2d_fp16_spatz(const float16 *X,
         return;
     }
 
-    PROF_PHASE(prof_cyc_data_in, ret, init_input_params(params, X, W, B));
+    PROF_PHASE(prof_cyc_data_in, ret, init_input_params((void *)params, X, W, B));
     if (ret != 0) {
         printf("[CV32 (%d)] [%s] Params initialization failed with error: %d\n",
                HID,
@@ -294,17 +212,91 @@ void MAGIA_conv2d_fp16_spatz(const float16 *X,
         return;
     }
 
-    PROF_PHASE(prof_cyc_compute, ret, offload_spatz_task(params));
+    PROF_PHASE(prof_cyc_compute, ret, mg_spatz_call(CONV2D_FP16_SPATZ_TASK, (const void *)params));
     if (ret != 0) {
-        printf("[CV32 (%d)] [%s] Spatz task offloading failed with error: %d\n",
-               HID,
-               KERNEL_NAME,
-               ret);
+        printf("[CV32 (%d)] [%s] Spatz task failed with exit code: %d\n", HID, KERNEL_NAME, ret);
         return;
     }
 
-    PROF_PHASE(prof_cyc_data_out, ret, store_result(params, Y));
+    PROF_PHASE(prof_cyc_data_out, ret, store_result((void *)params, Y));
     if (ret != 0) {
         printf("[CV32 (%d)] [%s] Result write back failed with error: %d\n", HID, KERNEL_NAME, ret);
     }
+}
+
+void MAGIA_conv2d_fp16_spatz_l1_start(conv2d_fp16_spatz_params_t *p,
+                                      const float16 *X,
+                                      const float16 *W,
+                                      const float16 *B,
+                                      float16 *Y,
+                                      uint32_t input_shape[4],
+                                      uint32_t output_shape[4],
+                                      uint32_t kernel_h,
+                                      uint32_t kernel_w,
+                                      uint32_t stride_h,
+                                      uint32_t stride_w,
+                                      uint32_t pad_h,
+                                      uint32_t pad_w,
+                                      uint32_t group,
+                                      int has_bias,
+                                      mg_event_t *event)
+{
+    conv2d_fp16_spatz_params_set(p,
+                                 X,
+                                 W,
+                                 B,
+                                 Y,
+                                 input_shape,
+                                 output_shape,
+                                 kernel_h,
+                                 kernel_w,
+                                 stride_h,
+                                 stride_w,
+                                 pad_h,
+                                 pad_w,
+                                 group,
+                                 has_bias);
+    mg_spatz_run(WFE, CONV2D_FP16_SPATZ_TASK, p, event, 0);
+}
+
+void MAGIA_conv2d_fp16_spatz_l1(const float16 *X,
+                                const float16 *W,
+                                const float16 *B,
+                                float16 *Y,
+                                uint32_t input_shape[4],
+                                uint32_t output_shape[4],
+                                uint32_t kernel_h,
+                                uint32_t kernel_w,
+                                uint32_t stride_h,
+                                uint32_t stride_w,
+                                uint32_t pad_h,
+                                uint32_t pad_w,
+                                uint32_t group,
+                                int has_bias)
+{
+    conv2d_fp16_spatz_params_t params;
+    mg_event_t event;
+
+    MAGIA_conv2d_fp16_spatz_l1_start(&params,
+                                     X,
+                                     W,
+                                     B,
+                                     Y,
+                                     input_shape,
+                                     output_shape,
+                                     kernel_h,
+                                     kernel_w,
+                                     stride_h,
+                                     stride_w,
+                                     pad_h,
+                                     pad_w,
+                                     group,
+                                     has_bias,
+                                     &event);
+    mg_spatz_wait(WFE, &event);
+    if (mg_spatz_exit_code() != 0)
+        printf("[CV32 (%d)] [%s] Spatz task failed with exit code: %d\n",
+               HID,
+               KERNEL_NAME,
+               mg_spatz_exit_code());
 }

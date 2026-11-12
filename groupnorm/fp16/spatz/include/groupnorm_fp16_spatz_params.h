@@ -24,6 +24,7 @@ typedef struct {
 
     uint32_t input_len;  /* Total elements of the input tensor            */
     uint32_t output_len; /* Local elements of the output shard            */
+    _Float16 eps_l1;     /* Storage for epsilon (L1 API)                  */
 } groupnorm_fp16_spatz_params_t;
 
 #endif /* GROUPNORM_FP16_SPATZ_PARAMS_H_ */

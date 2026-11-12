@@ -6,6 +6,8 @@
 #define ROPE_FP16_SPATZ_H_
 
 #include <stdint.h>
+#include "mg_event.h"
+#include "rope_fp16_spatz_params.h"
 
 /*
  * Rotary position embedding, rotate-half form (Llama, ONNX RotaryEmbedding with interleaved = 0):
@@ -32,5 +34,39 @@ void MAGIA_rope_fp16_spatz_l1(const float16 *X,
                               uint32_t n_heads,
                               uint32_t head_dim,
                               float16 *Y);
+
+/*
+ * As MAGIA_rope_fp16_spatz_l1, but only starts the Spatz task, with the parameter block `p`
+ * (which must stay valid until it completes): mg_spatz_wait(mode, event) waits for it.
+ */
+void MAGIA_rope_fp16_spatz_l1_start(rope_fp16_spatz_params_t *p,
+                                    const float16 *X,
+                                    const float16 *cos,
+                                    const float16 *sin,
+                                    uint32_t rows,
+                                    uint32_t n_heads,
+                                    uint32_t head_dim,
+                                    float16 *Y,
+                                    mg_event_t *event);
+
+/* Fill the parameter block `p` for MAGIA_rope_fp16_spatz_l1_start. */
+static inline void rope_fp16_spatz_params_set(rope_fp16_spatz_params_t *p,
+                                              const float16 *X,
+                                              const float16 *cos,
+                                              const float16 *sin,
+                                              uint32_t rows,
+                                              uint32_t n_heads,
+                                              uint32_t head_dim,
+                                              float16 *Y)
+{
+    p->shard_X  = (uintptr_t)X;
+    p->shard_Y  = (uintptr_t)Y;
+    p->cos      = (uintptr_t)cos;
+    p->sin      = (uintptr_t)sin;
+    p->r_start  = 0;
+    p->r_len    = rows;
+    p->n_heads  = n_heads;
+    p->head_dim = head_dim;
+}
 
 #endif /* ROPE_FP16_SPATZ_H_ */
