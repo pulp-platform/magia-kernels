@@ -28,7 +28,11 @@
 #    Tile (ii, jj) owns the block [tile_s x tile_e] of Y. It loads it with the residual, then
 #    accumulates onto it, with the reduction over I in blocks of FFN_KB_I.
 #
-# The test's gen_golden.py picks FFN_CI, FFN_KB_E and FFN_KB_I for each mesh size, so that the
+# Outer blocking: both steps run on PRJ_NB blocks of PRJ_SB = SEQ_LENGTH / PRJ_NB rows of S in turn (PRJ_NB must
+# divide SEQ_LENGTH), streaming the weights again for each block, so that the per-tile buffers shrink with the
+# block (PRJ_NB = 1: all the rows at once).
+#
+# The test's gen_golden.py picks FFN_CI, FFN_KB_E and FFN_KB_I for each mesh size and PRJ_NB, so that the
 # buffers fit in L1, and passes them as kernel arguments.
 
 from mgc import *
@@ -44,6 +48,8 @@ y_   = l2("y_out",   (S, E), fp16)
 y_gold = l2("y_gold", (S, E), fp16)  # golden
 
 WAIT_MODE = define(WFE)
+PRJ_NB = define(1)
+PRJ_SB = define("(SEQ_LENGTH / PRJ_NB)")
 
 # Implemented in src/kernels.c, on the tile's CV32 core:
 # spatz_swiglu_start starts g = silu(g) * u, element-wise and in place, on Spatz (kernels/swiglu_fast: Schraudolph
@@ -60,10 +66,11 @@ def ffn_swiglu():
     1. H = silu(X @ Wg) * (X @ Wu) in chunks of columns: output-static on RedMulE (G and U chunks resident in L1,
        blocks of E streamed), then SwiGLU on Spatz, overlapped with the next chunk;
     2. Y = R + H @ Wd, output-static, accumulating on R.
+    Both steps run on PRJ_NB blocks of PRJ_SB rows of S in turn.
     """
     for ii, jj in tiles():
 
-        tile_s = ii.split(S)
+        tile_s = ii.split(PRJ_SB)
         tile_i = jj.split(I)
         tile_e = jj.split(E)
 
@@ -82,65 +89,69 @@ def ffn_swiglu():
 
         sync(GLOBAL)
 
-        """
-        STEP 1: H = silu(X @ Wg) * (X @ Wu), one chunk of FFN_CI columns at a time. In each chunk, blocks k of X, Wg
-        and Wu load while RedMulE accumulates block k - 1. The SwiGLU of chunk c - 1 runs on Spatz during chunk c, and
-        its store is issued once RedMulE has the last jobs of chunk c.
-        """
+        for pb in range(PRJ_NB):
+            # first row of this tile in the block
+            s0: u32 = pb * PRJ_SB + tile_s.start
 
-        n_kb_e: u16 = E // KB_E
-        n_ci: u16 = tile_i.size // CI
-        ev_g = redmule.events()
-        ev_u = redmule.events()
-        for c in range(n_ci):
-            i0: u32 = tile_i.start + c * CI
-            for k in pipeline(n_kb_e):
+            """
+            STEP 1: H = silu(X @ Wg) * (X @ Wu), one chunk of FFN_CI columns at a time. In each chunk, blocks k of X, Wg
+            and Wu load while RedMulE accumulates block k - 1. The SwiGLU of chunk c - 1 runs on Spatz during chunk c, and
+            its store is issued once RedMulE has the last jobs of chunk c.
+            """
+
+            n_kb_e: u16 = E // KB_E
+            n_ci: u16 = tile_i.size // CI
+            ev_g = redmule.events()
+            ev_u = redmule.events()
+            for c in range(n_ci):
+                i0: u32 = tile_i.start + c * CI
+                for k in pipeline(n_kb_e):
+                    with stage(0):
+                        k0: u16 = k * KB_E
+                        ex  = idma.load(xg[k], x_[s0:s0 + tile_s.size, k0:k0 + KB_E])
+                        ewg = idma.load(wg[k], wg_[k0:k0 + KB_E, i0:i0 + CI])
+                        ewu = idma.load(wu[k], wu_[k0:k0 + KB_E, i0:i0 + CI])
+                    with stage(1):
+                        ev_g[k].wait()
+                    with stage(0):
+                        redmule.enqueue(xg[k], wg[k], yg[c], op=GEMM, event=ev_g[k], uninit=k == 0)
+                        ex.wait()
+                        ewg.wait()
+                        ewu.wait()
+                        redmule.commit_start()
+                    with stage(1):
+                        ev_u[k].wait()
+                    with stage(0):
+                        redmule.enqueue(xg[k], wu[k], yu[c], op=GEMM, event=ev_u[k], uninit=k == 0)
+                        redmule.commit_start()
+                        # store H chunk c - 1 once Spatz is done with it, while RedMulE runs the last jobs of chunk c
+                        if k == n_kb_e - 1:
+                            if c > 0:
+                                spatz_wait(yg[c - 1])
+                                idma.store(h_[s0:s0 + tile_s.size, i0 - CI:i0], yg[c - 1]).wait()
+                spatz_swiglu_start(yg[c], yu[c])
+                if c == n_ci - 1:
+                    spatz_wait(yg[c])
+                    idma.store(h_[s0:s0 + tile_s.size, i0:i0 + CI], yg[c]).wait()
+
+            # H complete in L2
+            sync(GLOBAL)
+
+            """
+            STEP 2: Y = R + H @ Wd, block k of H, Wd loading while RedMulE accumulates block k - 1
+            """
+
+            idma.load(yo, res_[s0:s0 + tile_s.size, tile_e]).wait()
+            n_kb_i: u16 = I // KB_I
+            for k in pipeline(n_kb_i):
                 with stage(0):
-                    k0: u16 = k * KB_E
-                    ex  = idma.load(xg[k], x_[tile_s, k0:k0 + KB_E])
-                    ewg = idma.load(wg[k], wg_[k0:k0 + KB_E, i0:i0 + CI])
-                    ewu = idma.load(wu[k], wu_[k0:k0 + KB_E, i0:i0 + CI])
-                with stage(1):
-                    ev_g[k].wait()
-                with stage(0):
-                    redmule.enqueue(xg[k], wg[k], yg[c], op=GEMM, event=ev_g[k], uninit=k == 0)
+                    k0: u16 = k * KB_I
+                    ex = idma.load(xd[k], h_[s0:s0 + tile_s.size, k0:k0 + KB_I])
+                    ew = idma.load(wd[k], wd_[k0:k0 + KB_I, tile_e])
+                    jd = redmule.enqueue(xd[k], wd[k], yo, op=GEMM)
                     ex.wait()
-                    ewg.wait()
-                    ewu.wait()
+                    ew.wait()
                     redmule.commit_start()
                 with stage(1):
-                    ev_u[k].wait()
-                with stage(0):
-                    redmule.enqueue(xg[k], wu[k], yu[c], op=GEMM, event=ev_u[k], uninit=k == 0)
-                    redmule.commit_start()
-                    # store H chunk c - 1 once Spatz is done with it, while RedMulE runs the last jobs of chunk c
-                    if k == n_kb_e - 1:
-                        if c > 0:
-                            spatz_wait(yg[c - 1])
-                            idma.store(h_[tile_s, i0 - CI:i0], yg[c - 1]).wait()
-            spatz_swiglu_start(yg[c], yu[c])
-            if c == n_ci - 1:
-                spatz_wait(yg[c])
-                idma.store(h_[tile_s, i0:i0 + CI], yg[c]).wait()
-
-        # H complete in L2
-        sync(GLOBAL)
-
-        """
-        STEP 2: Y = R + H @ Wd, block k of H, Wd loading while RedMulE accumulates block k - 1
-        """
-
-        idma.load(yo, res_[tile_s, tile_e]).wait()
-        n_kb_i: u16 = I // KB_I
-        for k in pipeline(n_kb_i):
-            with stage(0):
-                k0: u16 = k * KB_I
-                ex = idma.load(xd[k], h_[tile_s, k0:k0 + KB_I])
-                ew = idma.load(wd[k], wd_[k0:k0 + KB_I, tile_e])
-                jd = redmule.enqueue(xd[k], wd[k], yo, op=GEMM)
-                ex.wait()
-                ew.wait()
-                redmule.commit_start()
-            with stage(1):
-                jd.wait()
-        idma.store(y_[tile_s, tile_e], yo).wait()
+                    jd.wait()
+            idma.store(y_[s0:s0 + tile_s.size, tile_e], yo).wait()
