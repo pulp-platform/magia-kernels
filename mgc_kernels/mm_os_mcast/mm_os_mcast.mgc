@@ -1,0 +1,105 @@
+# Copyright 2026 ETH Zurich, University of Bologna and Fondazione Chips-IT.
+# Licensed under the Apache License, Version 2.0, see LICENSE for details.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Francesco Conti <f.conti@unibo.it>
+#
+# Output-static GEMM on the MAGIA mesh, as mm_os, with the operands multicast:
+#
+#     Z = X @ W + Y
+#
+# The tiles of a mesh row need the same X slice in each timeslot and the tiles of a mesh column the same W slice, so
+# one tile of the row loads the X slice from L2 and multicasts it to the other tiles of its row, and one tile of the
+# column does the same with the W slice down its column. L2 is read once per slice instead of once per tile.
+
+from mgc import *
+
+M, N, K = sizes("M_SIZE", "N_SIZE", "K_SIZE")  # kernel arguments
+X = l2("x_inp", (M, N), fp16)
+W = l2("w_inp", (N, K), fp16)
+Y = l2("y_inp", (M, K), fp16)  # bias in, result out
+Z = l2("z_out", (M, K), fp16)  # golden
+
+N_ITERATIONS = define(1)
+T_SIZE = define(64)  # reduction (N) rows per timeslot, N_SIZE / T_SIZE timeslots
+# Outer blocking: the output is processed in M_NB blocks of M_BLK rows in turn (M_NB must divide M_SIZE), so that
+# the L1-resident output block of a tile is M_BLK / MESH_Y_TILES rows (M_NB = 1: the whole output at once)
+M_NB = define(1)
+M_BLK = define("(M_SIZE / M_NB)")
+WAIT_MODE = define(WFE)
+
+
+@kernel("mgc_mm_os_mcast", check=(Y, Z), tol=0x11)
+def mm_os_mcast():
+    """
+    Output-static GEMM as mm_os, the X and W slices of each timeslot loaded from L2 by one tile of the row /
+    column and multicast to the others.
+    """
+    for y_id, x_id in tiles():
+        """
+        0. Outer blocking: output rows [mb * M_BLK, (mb + 1) * M_BLK) in turn.
+        """
+        for mb in range(M_NB):
+            """
+            1. The static output data-tile of this tile (as mm_os).
+            """
+            tile_h = y_id.split(M_BLK)
+            tile_w = x_id.split(K)
+            # first output row of this tile in the block
+            m0: u32 = mb * M_BLK + tile_h.start
+
+            t_size: u16 = T_SIZE
+            timeslots: u16 = N // t_size
+
+            """
+            2. Static output data-tile, resident in L1 for the whole block.
+            """
+            y = L1.single_buffer(Y[tile_h, tile_w])
+
+            """
+            2a. Input and weight data-tile multi-buffers. Depth 4: slot i is written by another tile (the multicast of
+            timeslot i, after the barrier of timeslot i - 1), so the job that last read it (timeslot i - 4) must have
+            been waited by every tile before that barrier.
+            """
+            x = L1.multi_buffer(X[tile_h, 0:t_size], depth=4)
+            w = L1.multi_buffer(W[0:t_size, tile_w], depth=4)
+            redmule_evt = redmule.events(2)
+
+            for z in range(N_ITERATIONS):
+                """
+                3. Load the static output tile, then run the timeslots as a software pipeline.
+                """
+                ey = idma.load(y, Y[m0:m0 + tile_h.size, tile_w])
+                for i in pipeline(timeslots):
+                    """
+                    4. Stage 0, one step ahead of the job: the tile of column i % MESH_X_TILES of each row loads the X
+                    slice of the row and multicasts it to the row, the tile of row i % MESH_Y_TILES of each column
+                    loads the W slice of the column and multicasts it down the column; then a barrier, after which
+                    every tile has its operands of timeslot i. Stage 1: the job; stage 2: its wait.
+                    """
+                    with stage(0):
+                        if x_id == i % MESH_X_TILES:
+                            ex = idma.load(x[i], X[m0:m0 + tile_h.size, i * t_size:(i + 1) * t_size])
+                        if y_id == i % MESH_Y_TILES:
+                            ew = idma.load(w[i], W[i * t_size:(i + 1) * t_size, tile_w])
+                        if x_id == i % MESH_X_TILES:
+                            ex.wait()
+                            emx = idma.store(x.row[i], x[i])
+                        if y_id == i % MESH_Y_TILES:
+                            ew.wait()
+                            emw = idma.store(w.col[i], w[i])
+                        if x_id == i % MESH_X_TILES:
+                            emx.wait()
+                        if y_id == i % MESH_Y_TILES:
+                            emw.wait()
+                        sync(GLOBAL)
+                    with stage(1):
+                        redmule.enqueue(x[i], w[i], y, op=GEMM, event=redmule_evt[i])
+                        redmule.commit_start()
+                    with stage(2):
+                        redmule_evt[i].wait()
+
+                """
+                5. Store the output data-tile back to L2
+                """
+                idma.store(Y[m0:m0 + tile_h.size, tile_w], y).wait()
