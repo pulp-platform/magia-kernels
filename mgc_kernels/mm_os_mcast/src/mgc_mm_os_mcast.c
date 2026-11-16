@@ -45,6 +45,7 @@ void mgc_mm_os_mcast(uint16_t *x_inp,
     eu_redmule_init(0);
     eu_idma_init(0);
     mg_fsync_init();
+    mg_event_t fsync_evt; // the split barrier in flight
 
     uint32_t y_id         = GET_Y_ID(hartid);
     uint32_t x_id         = GET_X_ID(hartid);
@@ -54,6 +55,8 @@ void mgc_mm_os_mcast(uint16_t *x_inp,
     volatile uint32_t w_pt;
     volatile uint32_t x_pt_next;
     volatile uint32_t w_pt_next;
+    volatile uint32_t x_pt_next2;
+    volatile uint32_t w_pt_next2;
 
     mg_event_t idma_evt_y, idma_evt_x_in, idma_evt_x_out, idma_evt_w_in, idma_evt_w_out;
     mg_event_t redmule_evt_0, redmule_evt_1;
@@ -102,9 +105,9 @@ void mgc_mm_os_mcast(uint16_t *x_inp,
             (uint32_t)y_inp + (tile_h_max * y_id * K_SIZE * 2) + (tile_w_max * x_id * 2);
 
         /**
-         * 2a. Input and weight data-tile multi-buffers. Depth 4: slot i is written by another tile
-         * (the multicast of timeslot i, after the barrier of timeslot i - 1), so the job that last
-         * read it (timeslot i - 4) must have been waited by every tile before that barrier.
+         * 2a. Input and weight data-tile multi-buffers, depth 3. The multicasts of timeslot i + 1
+         * write slot (i + 1) % 3 on the other tiles, i.e. the slot of timeslot i - 2: they start
+         * after the W barrier of timeslot i, which every tile enters after waiting its job i - 2.
          */
         uint32_t len_x       = t_size * 2;
         uint32_t std_x       = N_SIZE * 2;
@@ -112,20 +115,20 @@ void mgc_mm_os_mcast(uint16_t *x_inp,
         uint32_t l1_addr_x_0 = l1_addr_y + ((tile_h_max + 15) / 16 * 16 * tile_w_max * 2);
         uint32_t l1_addr_x_1 = l1_addr_x_0 + (tile_h_max * t_size * 2);
         uint32_t l1_addr_x_2 = l1_addr_x_1 + (tile_h_max * t_size * 2);
-        uint32_t l1_addr_x_3 = l1_addr_x_2 + (tile_h_max * t_size * 2);
         uint32_t l2_addr_x   = (uint32_t)x_inp + (tile_h_max * y_id * N_SIZE * 2);
         uint32_t len_w       = tile_w * 2;
         uint32_t std_w       = K_SIZE * 2;
         uint32_t reps_w      = (uint32_t)t_size;
-        uint32_t l1_addr_w_0 = l1_addr_x_3 + (tile_h_max * t_size * 2);
+        uint32_t l1_addr_w_0 = l1_addr_x_2 + (tile_h_max * t_size * 2);
         uint32_t l1_addr_w_1 = l1_addr_w_0 + (t_size * tile_w_max * 2);
         uint32_t l1_addr_w_2 = l1_addr_w_1 + (t_size * tile_w_max * 2);
-        uint32_t l1_addr_w_3 = l1_addr_w_2 + (t_size * tile_w_max * 2);
         uint32_t l2_addr_w   = (uint32_t)w_inp + (tile_w_max * x_id * 2);
 
         for (int z = 0; z < N_ITERATIONS; z++) {
             /**
-             * 3. Load the static output tile, then run the timeslots as a software pipeline.
+             * 3. Prologue: the output tile, the operands of timeslot 0 (loaded by tile (y_id, 0) /
+             * (0, x_id) and multicast, X then W, a barrier after each), the L2 loads of timeslot 1.
+             * The W barrier of timeslot 0 is only entered here: the loop waits it.
              */
             mg_idma_memcpy_2d(WAIT_MODE,
                               0,
@@ -137,7 +140,7 @@ void mgc_mm_os_mcast(uint16_t *x_inp,
                               &idma_evt_y,
                               NULL);
 
-            if (x_id == (0 % MESH_X_TILES)) {
+            if (x_id == 0) {
                 mg_idma_memcpy_2d(WAIT_MODE,
                                   0,
                                   l2_addr_x + ((m0 - tile_h_max * y_id) * N_SIZE * 2),
@@ -149,7 +152,7 @@ void mgc_mm_os_mcast(uint16_t *x_inp,
                                   NULL);
             }
 
-            if (y_id == (0 % MESH_Y_TILES)) {
+            if (y_id == 0) {
                 mg_idma_memcpy_2d(WAIT_MODE,
                                   0,
                                   l2_addr_w,
@@ -161,7 +164,7 @@ void mgc_mm_os_mcast(uint16_t *x_inp,
                                   NULL);
             }
 
-            if (x_id == (0 % MESH_X_TILES)) {
+            if (x_id == 0) {
                 mg_idma_wait(0, WAIT_MODE, &idma_evt_x_in);
 
                 mg_idma_mcast_row(WAIT_MODE,
@@ -171,9 +174,11 @@ void mgc_mm_os_mcast(uint16_t *x_inp,
                                   tile_h * t_size * 2,
                                   &idma_evt_x_out,
                                   NULL);
+                mg_idma_wait(1, WAIT_MODE, &idma_evt_x_out);
             }
+            mg_fsync_global(WAIT_MODE);
 
-            if (y_id == (0 % MESH_Y_TILES)) {
+            if (y_id == 0) {
                 mg_idma_wait(0, WAIT_MODE, &idma_evt_w_in);
 
                 mg_idma_mcast_col(WAIT_MODE,
@@ -185,30 +190,57 @@ void mgc_mm_os_mcast(uint16_t *x_inp,
                                   NULL);
             }
 
-            if (x_id == (0 % MESH_X_TILES)) {
-                mg_idma_wait(1, WAIT_MODE, &idma_evt_x_out);
+            if (timeslots > 1) {
+                if (x_id == (1 % MESH_X_TILES)) {
+                    mg_idma_memcpy_2d(WAIT_MODE,
+                                      0,
+                                      l2_addr_x + ((m0 - tile_h_max * y_id) * N_SIZE * 2) +
+                                          (t_size * 2),
+                                      l1_addr_x_1,
+                                      len_x,
+                                      std_x,
+                                      reps_x,
+                                      &idma_evt_x_in,
+                                      NULL);
+                }
             }
 
-            if (y_id == (0 % MESH_Y_TILES)) {
+            if (y_id == 0) {
                 mg_idma_wait(1, WAIT_MODE, &idma_evt_w_out);
             }
-            mg_fsync_global(WAIT_MODE);
+
+            if (timeslots > 1) {
+                if (y_id == (1 % MESH_Y_TILES)) {
+                    mg_idma_memcpy_2d(WAIT_MODE,
+                                      0,
+                                      l2_addr_w + (t_size * K_SIZE * 2),
+                                      l1_addr_w_1,
+                                      len_w,
+                                      std_w,
+                                      reps_w,
+                                      &idma_evt_w_in,
+                                      NULL);
+                }
+            }
+            mg_fsync_global_start(&fsync_evt, NULL);
             mg_idma_wait(0, WAIT_MODE, &idma_evt_y);
 
             /**
-             * 4. Stage 0, one step ahead of the job: the tile of column i % MESH_X_TILES of each
-             * row loads the X slice of the row and multicasts it to the row, the tile of row i %
-             * MESH_Y_TILES of each column loads the W slice of the column and multicasts it down
-             * the column; then a barrier, after which every tile has its operands of timeslot i.
-             * Stage 1: the job; stage 2: its wait.
+             * 4. Timeslot i: wait the W barrier of i (its operands have landed), start job i, then
+             * move the operands of i + 1 while it runs, with split barriers (sync_start /
+             * sync_wait) so that only the tile that pushes waits for its multicast:
+             *   - X: the tile of column (i + 1) % MESH_X_TILES of each row multicasts the X slice
+             * to its row; the others enter the barrier at once, the pusher after its multicast has
+             * completed;
+             *   - W, only once the X barrier is released (a row and a column hardware multicast
+             * that cross can deadlock in the NoC): the same down the columns, its barrier waited at
+             * the next timeslot. The L2 loads of timeslot i + 2 go into the slot of job i - 1: the
+             * W one right after waiting that job (it is the long one: its multicast waits for it),
+             * the X one after the X multicast.
              */
-            /**
-             * pipeline: 3 stages; step i runs stage k on iteration i + 1 - k
-             * x            stages 0..2  depth 4
-             * w            stages 0..2  depth 4
-             * redmule_evt  stages 1..2  depth 2
-             */
-            for (int i = 0; i < timeslots + 1; i++) {
+            for (int i = 0; i < timeslots; i++) {
+                mg_fsync_wait(WAIT_MODE, &fsync_evt);
+
                 if (i % 2) {
                     redmule_evt_curr = &redmule_evt_1;
                     redmule_evt_prev = &redmule_evt_0;
@@ -217,59 +249,45 @@ void mgc_mm_os_mcast(uint16_t *x_inp,
                     redmule_evt_prev = &redmule_evt_1;
                 }
 
-                switch (i % 4) {
+                switch (i % 3) {
                 case 0:
-                    x_pt      = l1_addr_x_0;
-                    x_pt_next = l1_addr_x_1;
-                    w_pt      = l1_addr_w_0;
-                    w_pt_next = l1_addr_w_1;
+                    x_pt       = l1_addr_x_0;
+                    x_pt_next  = l1_addr_x_1;
+                    x_pt_next2 = l1_addr_x_2;
+                    w_pt       = l1_addr_w_0;
+                    w_pt_next  = l1_addr_w_1;
+                    w_pt_next2 = l1_addr_w_2;
                     break;
                 case 1:
-                    x_pt      = l1_addr_x_1;
-                    x_pt_next = l1_addr_x_2;
-                    w_pt      = l1_addr_w_1;
-                    w_pt_next = l1_addr_w_2;
+                    x_pt       = l1_addr_x_1;
+                    x_pt_next  = l1_addr_x_2;
+                    x_pt_next2 = l1_addr_x_0;
+                    w_pt       = l1_addr_w_1;
+                    w_pt_next  = l1_addr_w_2;
+                    w_pt_next2 = l1_addr_w_0;
                     break;
                 case 2:
-                    x_pt      = l1_addr_x_2;
-                    x_pt_next = l1_addr_x_3;
-                    w_pt      = l1_addr_w_2;
-                    w_pt_next = l1_addr_w_3;
-                    break;
-                case 3:
-                    x_pt      = l1_addr_x_3;
-                    x_pt_next = l1_addr_x_0;
-                    w_pt      = l1_addr_w_3;
-                    w_pt_next = l1_addr_w_0;
+                    x_pt       = l1_addr_x_2;
+                    x_pt_next  = l1_addr_x_0;
+                    x_pt_next2 = l1_addr_x_1;
+                    w_pt       = l1_addr_w_2;
+                    w_pt_next  = l1_addr_w_0;
+                    w_pt_next2 = l1_addr_w_1;
                     break;
                 }
 
+                mg_redmule_gemm_enqueue(WAIT_MODE,
+                                        x_pt,
+                                        w_pt,
+                                        l1_addr_y,
+                                        (uint16_t)tile_h,
+                                        (uint16_t)t_size,
+                                        (uint16_t)tile_w,
+                                        redmule_evt_curr,
+                                        NULL);
+                mg_redmule_gemm_commit_start();
+
                 if (i < (timeslots - 1)) {
-                    if (x_id == ((i + 1) % MESH_X_TILES)) {
-                        mg_idma_memcpy_2d(WAIT_MODE,
-                                          0,
-                                          l2_addr_x + ((m0 - tile_h_max * y_id) * N_SIZE * 2) +
-                                              ((i + 1) * t_size * 2),
-                                          x_pt_next,
-                                          len_x,
-                                          std_x,
-                                          reps_x,
-                                          &idma_evt_x_in,
-                                          NULL);
-                    }
-
-                    if (y_id == ((i + 1) % MESH_Y_TILES)) {
-                        mg_idma_memcpy_2d(WAIT_MODE,
-                                          0,
-                                          l2_addr_w + ((i + 1) * t_size * K_SIZE * 2),
-                                          w_pt_next,
-                                          len_w,
-                                          std_w,
-                                          reps_w,
-                                          &idma_evt_w_in,
-                                          NULL);
-                    }
-
                     if (x_id == ((i + 1) % MESH_X_TILES)) {
                         mg_idma_wait(0, WAIT_MODE, &idma_evt_x_in);
 
@@ -280,7 +298,50 @@ void mgc_mm_os_mcast(uint16_t *x_inp,
                                           tile_h * t_size * 2,
                                           &idma_evt_x_out,
                                           NULL);
+                    } else {
+                        mg_fsync_global_start(&fsync_evt, NULL);
                     }
+                }
+
+                if (i > 0) {
+                    mg_redmule_wait(WAIT_MODE, redmule_evt_prev);
+                }
+
+                if (i < (timeslots - 2)) {
+                    if (y_id == ((i + 2) % MESH_Y_TILES)) {
+                        mg_idma_memcpy_2d(WAIT_MODE,
+                                          0,
+                                          l2_addr_w + ((i + 2) * t_size * K_SIZE * 2),
+                                          w_pt_next2,
+                                          len_w,
+                                          std_w,
+                                          reps_w,
+                                          &idma_evt_w_in,
+                                          NULL);
+                    }
+                }
+
+                if (i < (timeslots - 1)) {
+                    if (x_id == ((i + 1) % MESH_X_TILES)) {
+                        mg_idma_wait(1, WAIT_MODE, &idma_evt_x_out);
+                        mg_fsync_global_start(&fsync_evt, NULL);
+                    }
+
+                    if (i < (timeslots - 2)) {
+                        if (x_id == ((i + 2) % MESH_X_TILES)) {
+                            mg_idma_memcpy_2d(WAIT_MODE,
+                                              0,
+                                              l2_addr_x + ((m0 - tile_h_max * y_id) * N_SIZE * 2) +
+                                                  ((i + 2) * t_size * 2),
+                                              x_pt_next2,
+                                              len_x,
+                                              std_x,
+                                              reps_x,
+                                              &idma_evt_x_in,
+                                              NULL);
+                        }
+                    }
+                    mg_fsync_wait(WAIT_MODE, &fsync_evt);
 
                     if (y_id == ((i + 1) % MESH_Y_TILES)) {
                         mg_idma_wait(0, WAIT_MODE, &idma_evt_w_in);
@@ -292,33 +353,11 @@ void mgc_mm_os_mcast(uint16_t *x_inp,
                                           t_size * tile_w * 2,
                                           &idma_evt_w_out,
                                           NULL);
-                    }
-
-                    if (x_id == ((i + 1) % MESH_X_TILES)) {
-                        mg_idma_wait(1, WAIT_MODE, &idma_evt_x_out);
-                    }
-
-                    if (y_id == ((i + 1) % MESH_Y_TILES)) {
                         mg_idma_wait(1, WAIT_MODE, &idma_evt_w_out);
                     }
-                    mg_fsync_global(WAIT_MODE);
-                }
-
-                if (i < timeslots) {
-                    mg_redmule_gemm_enqueue(WAIT_MODE,
-                                            x_pt,
-                                            w_pt,
-                                            l1_addr_y,
-                                            (uint16_t)tile_h,
-                                            (uint16_t)t_size,
-                                            (uint16_t)tile_w,
-                                            redmule_evt_curr,
-                                            NULL);
-                    mg_redmule_gemm_commit_start();
-                }
-
-                if (i > 0) {
-                    mg_redmule_wait(WAIT_MODE, redmule_evt_prev);
+                    mg_fsync_global_start(&fsync_evt, NULL);
+                } else {
+                    mg_redmule_wait(WAIT_MODE, redmule_evt_curr);
                 }
             }
 

@@ -57,46 +57,84 @@ def mm_os_mcast():
             y = L1.single_buffer(Y[tile_h, tile_w])
 
             """
-            2a. Input and weight data-tile multi-buffers. Depth 4: slot i is written by another tile (the multicast of
-            timeslot i, after the barrier of timeslot i - 1), so the job that last read it (timeslot i - 4) must have
-            been waited by every tile before that barrier.
+            2a. Input and weight data-tile multi-buffers, depth 3. The multicasts of timeslot i + 1 write slot
+            (i + 1) % 3 on the other tiles, i.e. the slot of timeslot i - 2: they start after the W barrier of
+            timeslot i, which every tile enters after waiting its job i - 2.
             """
-            x = L1.multi_buffer(X[tile_h, 0:t_size], depth=4)
-            w = L1.multi_buffer(W[0:t_size, tile_w], depth=4)
+            x = L1.multi_buffer(X[tile_h, 0:t_size], depth=3)
+            w = L1.multi_buffer(W[0:t_size, tile_w], depth=3)
             redmule_evt = redmule.events(2)
 
             for z in range(N_ITERATIONS):
                 """
-                3. Load the static output tile, then run the timeslots as a software pipeline.
+                3. Prologue: the output tile, the operands of timeslot 0 (loaded by tile (y_id, 0) / (0, x_id) and
+                multicast, X then W, a barrier after each), the L2 loads of timeslot 1. The W barrier of timeslot 0 is
+                only entered here: the loop waits it.
                 """
                 ey = idma.load(y, Y[m0:m0 + tile_h.size, tile_w])
-                for i in pipeline(timeslots):
-                    """
-                    4. Stage 0, one step ahead of the job: the tile of column i % MESH_X_TILES of each row loads the X
-                    slice of the row and multicasts it to the row, the tile of row i % MESH_Y_TILES of each column
-                    loads the W slice of the column and multicasts it down the column; then a barrier, after which
-                    every tile has its operands of timeslot i. Stage 1: the job; stage 2: its wait.
-                    """
-                    with stage(0):
-                        if x_id == i % MESH_X_TILES:
-                            ex = idma.load(x[i], X[m0:m0 + tile_h.size, i * t_size:(i + 1) * t_size])
-                        if y_id == i % MESH_Y_TILES:
-                            ew = idma.load(w[i], W[i * t_size:(i + 1) * t_size, tile_w])
-                        if x_id == i % MESH_X_TILES:
+                if x_id == 0:
+                    ex = idma.load(x[0], X[m0:m0 + tile_h.size, 0:t_size])
+                if y_id == 0:
+                    ew = idma.load(w[0], W[0:t_size, tile_w])
+                if x_id == 0:
+                    ex.wait()
+                    emx = idma.store(x.row[0], x[0])
+                    emx.wait()
+                sync(GLOBAL)
+                if y_id == 0:
+                    ew.wait()
+                    emw = idma.store(w.col[0], w[0])
+                if timeslots > 1:
+                    if x_id == 1 % MESH_X_TILES:
+                        ex = idma.load(x[1], X[m0:m0 + tile_h.size, t_size:2 * t_size])
+                if y_id == 0:
+                    emw.wait()
+                if timeslots > 1:
+                    if y_id == 1 % MESH_Y_TILES:
+                        ew = idma.load(w[1], W[t_size:2 * t_size, tile_w])
+                sync_start(GLOBAL)
+                ey.wait()
+
+                """
+                4. Timeslot i: wait the W barrier of i (its operands have landed), start job i, then move the
+                operands of i + 1 while it runs, with split barriers (sync_start / sync_wait) so that only the tile
+                that pushes waits for its multicast:
+                  - X: the tile of column (i + 1) % MESH_X_TILES of each row multicasts the X slice to its row; the
+                    others enter the barrier at once, the pusher after its multicast has completed;
+                  - W, only once the X barrier is released (a row and a column hardware multicast that cross can
+                    deadlock in the NoC): the same down the columns, its barrier waited at the next timeslot.
+                The L2 loads of timeslot i + 2 go into the slot of job i - 1: the W one right after waiting that job (it is
+                the long one: its multicast waits for it), the X one after the X multicast.
+                """
+                for i in range(timeslots):
+                    sync_wait()
+                    redmule.enqueue(x[i], w[i], y, op=GEMM, event=redmule_evt[i])
+                    redmule.commit_start()
+                    if i < timeslots - 1:
+                        if x_id == (i + 1) % MESH_X_TILES:
                             ex.wait()
-                            emx = idma.store(x.row[i], x[i])
-                        if y_id == i % MESH_Y_TILES:
-                            ew.wait()
-                            emw = idma.store(w.col[i], w[i])
-                        if x_id == i % MESH_X_TILES:
+                            emx = idma.store(x.row[i + 1], x[i + 1])
+                        else:
+                            sync_start(GLOBAL)
+                    if i > 0:
+                        redmule_evt[i - 1].wait()
+                    if i < timeslots - 2:
+                        if y_id == (i + 2) % MESH_Y_TILES:
+                            ew = idma.load(w[i + 2], W[(i + 2) * t_size:(i + 3) * t_size, tile_w])
+                    if i < timeslots - 1:
+                        if x_id == (i + 1) % MESH_X_TILES:
                             emx.wait()
-                        if y_id == i % MESH_Y_TILES:
+                            sync_start(GLOBAL)
+                        if i < timeslots - 2:
+                            if x_id == (i + 2) % MESH_X_TILES:
+                                ex = idma.load(x[i + 2], X[m0:m0 + tile_h.size, (i + 2) * t_size:(i + 3) * t_size])
+                        sync_wait()
+                        if y_id == (i + 1) % MESH_Y_TILES:
+                            ew.wait()
+                            emw = idma.store(w.col[i + 1], w[i + 1])
                             emw.wait()
-                        sync(GLOBAL)
-                    with stage(1):
-                        redmule.enqueue(x[i], w[i], y, op=GEMM, event=redmule_evt[i])
-                        redmule.commit_start()
-                    with stage(2):
+                        sync_start(GLOBAL)
+                    else:
                         redmule_evt[i].wait()
 
                 """
