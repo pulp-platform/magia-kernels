@@ -24,7 +24,8 @@ static inline float sum_squares(const _Float16 *src, size_t len)
     for (avl = len; avl > 0; avl -= vl) {
         /* tail undisturbed: the lanes past a short last chunk keep their partial sums */
         asm volatile("vsetvli %0, %1, e16, m4, tu, ma" : "=r"(vl) : "r"(avl));
-        asm volatile("vle16.v v0, (%0)" ::"r"(src));
+        /* fence: load->fmul->reduce hazard on the last iteration (#1) */
+        asm volatile("vle16.v v0, (%0)" SPATZ_VLD_FENCE ::"r"(src));
         asm volatile("vfwmacc.vv v8, v0, v0");
         src += vl;
     }
