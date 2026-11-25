@@ -64,9 +64,6 @@ void mgc_unfused_attn(uint16_t *q_inp,
     redmule_init();
 
     eu_init();
-    eu_redmule_init(0);
-    eu_idma_init(0);
-    eu_fsync_init(0);
 
     uint32_t y_id         = GET_Y_ID(hartid);
     uint32_t x_id         = GET_X_ID(hartid);

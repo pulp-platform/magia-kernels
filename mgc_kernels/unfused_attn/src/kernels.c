@@ -39,7 +39,6 @@ void l1_softmax_rows_fp16_spatz(uint32_t x, uint32_t rows, uint32_t cols)
         min_coef.f[0] = (float16)(SOFTMAX_ROWS_EXP_MIN / (float)s);
         min_coef.f[1] = (float16)(SOFTMAX_ROWS_EXP_COEF * (float)s);
         p->min_coef   = min_coef.u;
-        eu_spatz_init(0);
         spatz_init(SPATZ_BINARY_START);
         spatz_ready = 1;
     }

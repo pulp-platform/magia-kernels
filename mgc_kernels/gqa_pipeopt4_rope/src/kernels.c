@@ -55,7 +55,6 @@ static void spatz_setup(void)
 {
     if (spatz_ready)
         return;
-    eu_spatz_init(0);
     spatz_init(SPATZ_BINARY_START);
     spatz_ready = 1;
 }
