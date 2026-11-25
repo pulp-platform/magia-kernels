@@ -180,9 +180,6 @@ void mgc_gqa_pipeopt4_rope(uint16_t *x_inp,
     redmule_init();
 
     eu_init();
-    eu_redmule_init(0);
-    eu_idma_init(0);
-    eu_fsync_init(0);
 
     uint32_t ii           = GET_Y_ID(hartid);
     uint32_t jj           = GET_X_ID(hartid);
@@ -504,6 +501,8 @@ void mgc_gqa_pipeopt4_rope(uint16_t *x_inp,
      * for one step later.
      */
     // bias and RoPE tables of Q, needed after the loop
+    if(hartid == 0)
+        printf("REACHED STAGE 1: THE 3 IDMAs\n");
     mg_idma_memcpy_1d(WAIT_MODE, 0, l2_addr_bq, l1_addr_bq, len_bq, &idma_evt_bq, NULL);
 
     mg_idma_memcpy_1d(WAIT_MODE, 0, l2_addr_cq, l1_addr_cq, len_cq, &idma_evt_cq, NULL);
@@ -545,6 +544,8 @@ void mgc_gqa_pipeopt4_rope(uint16_t *x_inp,
     mg_idma_wait(0, WAIT_MODE, &idma_evt_wq);
     mg_redmule_gemm_commit_start();
 
+    if(hartid == 0)
+        printf("REACHED PIPELINE START\n");
     /**
      * pipeline: 2 stages; step k runs stage k on iteration k + 1 - k
      * xq            stages 0..1  depth 2
@@ -617,6 +618,8 @@ void mgc_gqa_pipeopt4_rope(uint16_t *x_inp,
     l1_bias_rope_q_start_fp16_spatz(
         l1_addr_yq, l1_addr_bq, l1_addr_cq, l1_addr_sq, tile_s, tile_hp);
 
+    if(hartid == 0)
+        printf("REACHED STEP 2: I wished it stopped before tho\n");
     /**
      * STEP 2: Kt = Wk^T @ X^T, pipelined like step 1; then Q is stored, and Spatz adds the bias to
      * Kt and applies RoPE
