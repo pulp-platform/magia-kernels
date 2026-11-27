@@ -180,6 +180,8 @@ void mgc_gqa_pipeopt4_rope(uint16_t *x_inp,
     redmule_init();
 
     eu_init();
+    mg_fsync_init();
+    mg_spatz_init();
 
     uint32_t ii           = GET_Y_ID(hartid);
     uint32_t jj           = GET_X_ID(hartid);
@@ -392,12 +394,12 @@ void mgc_gqa_pipeopt4_rope(uint16_t *x_inp,
     uint32_t l2_addr_xk   = (uint32_t)xt_inp + (tile_ks_max * jj * 2);
 
     // V projection: tile (ii, jj) owns the block [tile_s x tile_kvhp] of V, computed like Q
-    uint32_t len_yv       = tile_kvhp * 2;
-    uint32_t std_yv       = NUM_KV_HEADS * PROJ_SIZE * 2;
-    uint32_t reps_yv      = (uint32_t)tile_s;
-    uint32_t l1_addr_yv   = l1_addr_sk + (PROJ_SIZE / 2 * tile_ks_max * 2);
-    uint32_t l2_addr_yv   = (uint32_t)v_l2 + (tile_s_max * ii * NUM_KV_HEADS * PROJ_SIZE * 2) +
-                            (tile_kvhp_max * jj * 2);
+    uint32_t len_yv     = tile_kvhp * 2;
+    uint32_t std_yv     = NUM_KV_HEADS * PROJ_SIZE * 2;
+    uint32_t reps_yv    = (uint32_t)tile_s;
+    uint32_t l1_addr_yv = l1_addr_sk + (PROJ_SIZE / 2 * tile_ks_max * 2);
+    uint32_t l2_addr_yv = (uint32_t)v_l2 + (tile_s_max * ii * NUM_KV_HEADS * PROJ_SIZE * 2) +
+                          (tile_kvhp_max * jj * 2);
     uint32_t len_bv       = tile_kvhp * 2;
     uint32_t l1_addr_bv   = l1_addr_yv + ((tile_s_max + 15) / 16 * 16 * tile_kvhp_max * 2);
     uint32_t l2_addr_bv   = (uint32_t)bv_inp + (tile_kvhp_max * jj * 2);
@@ -500,8 +502,6 @@ void mgc_gqa_pipeopt4_rope(uint16_t *x_inp,
      * for one step later.
      */
     // bias and RoPE tables of Q, needed after the loop
-    if(hartid == 0)
-        printf("REACHED STAGE 1: THE 3 IDMAs\n");
     mg_idma_memcpy_1d(WAIT_MODE, 0, l2_addr_bq, l1_addr_bq, len_bq, &idma_evt_bq, NULL);
 
     mg_idma_memcpy_1d(WAIT_MODE, 0, l2_addr_cq, l1_addr_cq, len_cq, &idma_evt_cq, NULL);
@@ -543,8 +543,6 @@ void mgc_gqa_pipeopt4_rope(uint16_t *x_inp,
     mg_idma_wait(0, WAIT_MODE, &idma_evt_wq);
     mg_redmule_gemm_commit_start();
 
-    if(hartid == 0)
-        printf("REACHED PIPELINE START\n");
     /**
      * pipeline: 2 stages; step k runs stage k on iteration k + 1 - k
      * xq            stages 0..1  depth 2
@@ -617,8 +615,6 @@ void mgc_gqa_pipeopt4_rope(uint16_t *x_inp,
     l1_bias_rope_q_start_fp16_spatz(
         l1_addr_yq, l1_addr_bq, l1_addr_cq, l1_addr_sq, tile_s, tile_hp);
 
-    if(hartid == 0)
-        printf("REACHED STEP 2: I wished it stopped before tho\n");
     /**
      * STEP 2: Kt = Wk^T @ X^T, pipelined like step 1; then Q is stored, and Spatz adds the bias to
      * Kt and applies RoPE

@@ -92,6 +92,8 @@ void mgc_flat_attn_pipeopt2(uint16_t *q_inp,
     redmule_init();
 
     eu_init();
+    mg_fsync_init();
+    mg_spatz_init();
 
     uint32_t ii           = GET_Y_ID(hartid);
     uint32_t jj           = GET_X_ID(hartid);

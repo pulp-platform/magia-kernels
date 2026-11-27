@@ -80,6 +80,8 @@ void mgc_conv_im2col(uint16_t *x_inp,
     redmule_init();
 
     eu_init();
+    mg_fsync_init();
+    mg_spatz_init();
 
     uint32_t ii           = GET_Y_ID(hartid);
     uint32_t jj           = GET_X_ID(hartid);

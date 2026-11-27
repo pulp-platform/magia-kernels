@@ -39,6 +39,7 @@ void mgc_mm_is(uint16_t *x_inp,
     redmule_init();
 
     eu_init();
+    mg_fsync_init();
 
     uint32_t y_id         = GET_Y_ID(hartid);
     uint32_t x_id         = GET_X_ID(hartid);

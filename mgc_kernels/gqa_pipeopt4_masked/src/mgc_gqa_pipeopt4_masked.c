@@ -152,8 +152,6 @@ void mgc_gqa_pipeopt4_masked(uint16_t *x_inp,
     redmule_init();
 
     eu_init();
-    eu_redmule_init(0);
-    eu_idma_init(0);
     mg_fsync_init();
     mg_spatz_init();
 
